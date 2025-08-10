@@ -1,0 +1,139 @@
+# tinygrad
+
+<https://docs.tinygrad.org/>
+
+<https://github.com/tinygrad/tinygrad>
+
+<https://github.com/tinygrad/tinygrad/blob/master/docs/quickstart.md>
+
+<https://github.com/mesozoic-egg/tinygrad-notes>
+
+<https://xl0.github.io/tinygrad-notes/>
+
+<https://mesozoic-egg.github.io/tinygrad-notes/20241217_st.html>
+
+<https://github.com/mesozoic-egg/tinygrad-notes/blob/main/20240102_jit.md>
+
+bounties
+<https://docs.google.com/spreadsheets/d/1WKHbT-7KOgjEawq5h5Ic1qUWzpfAzuD_J06N1JwOCGs/edit?usp=sharing>
+
+```
+$ nix-shell
+$ pipenv shell
+$ pipenv install .
+```
+
+show which backends are working:
+```
+$ python3 -m tinygrad.device
+````
+
+- frontend: handles autograd and lowering to Ops (cf. teenygrad) -- `tensor.py`,
+  `mlops.py`
+- ast builder: groups ops into valid ASTs -- `lazy.py`
+- optimizer: determines correct shapes on ASTs -- `optimizer.py`
+- linearizer: converts ASTs into "flat UOps" (???) -- `linearizer.py`
+- assembly (optional): do register assignment of UOps to take it out of SSA form
+  (TODO: clarify)
+- renderer: converts UOps -> code
+- runtime: compiles and runs code
+
+directories:
+
+- `./cache/` -- empty
+- `./disassemblers/adreno/` -- ???
+- `./docs/` -- documentation
+- `./examples/` -- examples of using tinygrad
+- `./extra/` -- ???
+- `./models/` -- reference models
+- `./openpilot/` -- ???
+- `./test/` -- CI tests (except `./test/external/`)
+- `./tinygrad/` -- source code
+- `./weights/` -- ???
+- `./.github/workflows/` -- CI workflows
+
+other files:
+
+- `./compile.sh` -- compile tinygrad with mypyc
+- `./CONTRIBUTING.md`
+- `./LICENSE`
+- `./push_pypi.sh` -- ??? push to PyPI
+- `./README.md`
+- `./rmso.sh` -- remove tinygrad .so files
+- `./run_multibackend.sh` -- run a python3 command on multiple backends
+- `./setup.py` -- distutils setup script
+- `./strip_whitespace.sh` -- remove whitespace from tinygrad source
+- `./sz.py` -- line count tinygrad source
+- `./.pre-commit-config.yaml` -- git pre-commit hooks
+
+tinygrad is a JIT compiler
+
+```
+$ nix-shell
+$ pipenv shell
+$ pipenv install '.[linting,testing]'
+# linter and unit tests from .github/workflows/test.yml follow
+$ python -m pylint --disable=all -e W0311 -e C0303 --jobs=0 --indent-string='  ' --recursive=y .
+$ python3 -m ruff check .
+$ python -m pylint tinygrad/
+$ PYTHONPATH="." python -m mypy --strict-equality
+$ awk '/```python/{flag=1;next}/```/{flag=0}flag' README.md > README.py &&  PYTHONPATH=. python README.py
+$ python test/external/fuzz_symbolic.py
+$ PYTHONPATH="." python test/external/fuzz_shapetracker.py
+$ PYTHONPATH="." python test/external/fuzz_shapetracker_math.py
+$ MAX_LINE_COUNT=9999 python sz.py
+# test docs
+$ python docs/abstractions2.py
+$ python docs/abstractions3.py
+$ awk '/```python/{flag=1;next}/```/{flag=0}flag' docs/quickstart.md > quickstart.py && PYTHONPATH=. python quickstart.py
+$ DEBUG=100 python3 -c "from tinygrad import Tensor; N = 1024; a, b = Tensor.rand(N, N), Tensor.rand(N, N); c = (a.reshape(N, 1, N) * b.T.reshape(1, N, N)).sum(axis=2); print((c.numpy() - (a.numpy() @ b.numpy())).mean())"
+$ CLANG=1 PYTHONPATH="." python examples/compile_efficientnet.py > recognize.c
+$ clang -O2 recognize.c -lm -o recognize
+$ cat test/models/efficientnet/Chicken.jpg | ./recognize | grep cock
+```
+
+note running examples such as LLaMA might require modifying the following line in `tinygrad/runtime/autogen/libc.py`:
+```
+#_libraries['libc'] = None if (libc_path := ctypes.util.find_library('c')) is None else ctypes.CDLL(libc_path) #  ctypes.CDLL('libc')
+_libraries['libc'] = ctypes.CDLL('/nix/store/dbcw19dshdwnxdv5q2g6wldj6syyvq7l-glibc-2.39-52/lib/libc.so.6')
+```
+to the appropriate path to `libc.so.6`
+
+TODO: can the above be fixed by adding glibc to LD_LIBRARY_PATH in shell.nix?
+
+
+## Docs
+
+quickstart <https://github.com/tinygrad/tinygrad/blob/master/docs/quickstart.md>
+
+***
+
+<https://github.com/mesozoic-egg/tinygrad-notes>:
+
+two "facades" to tinygrad:
+
+1. deep learning facade -- tensors and backpropagation
+2. compiler facade -- how to generate GPU code for any given tensor computation
+   and handle relevant *scheduling* (when and how to run generated code)
+
+<https://github.com/mesozoic-egg/tinygrad-notes/blob/main/20241129_viz.md>:
+
+run with `VIZ=1` and open `http://127.0.0.1:8000`
+
+
+## Bounties
+
+**Modify shapetracker simplify to produce a canonical shapetracker such that two
+equivalent shapetrackers are equal**
+
+`tinygrad/shape/shapetracker.py`
+
+`class Shapetracker`
+
+**Training TinyLlama with >50% MFU (model FLOPS utilization)**
+
+**mlperf**
+
+**Implement DreamerV3, EfficientZero, or similar in tinygrad (to solve Atari games in reasonable time)**
+
+**Proof or disproof of the mergeability of two arbitrary ShapeTrackers in Lean (see docs/reshape_without_symbolic.md)**
