@@ -1,31 +1,16 @@
 from __future__ import annotations
-import platform, subprocess, sys, ctypes, functools, time, mmap, threading, queue
-from tinygrad.helpers import capstone_flatdump, getenv, from_mv, to_mv, OSX, WIN, mv_address, wait_cond, cpu_profile
-from tinygrad.device import Compiler, BufferSpec, DMACPURef
+import platform, sys, ctypes, functools, time, mmap, threading, queue
+from tinygrad.helpers import from_mv, to_mv, OSX, WIN, mv_address, wait_cond, cpu_profile, suppress_finalizing, unwrap
+from tinygrad.device import BufferSpec, DMACPURef
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQBuffer, HWQueue, HCQArgsState, HCQSignal, HCQProgram, MMIOInterface
-from tinygrad.runtime.support.elf import jit_loader
 from tinygrad.renderer.cstyle import ClangRenderer
+from tinygrad.renderer.llvmir import LLVMRenderer
+from tinygrad.runtime.support.compiler_cpu import CPULLVMCompiler, ClangJITCompiler
 from tinygrad.uop.ops import sint
 
 class CPUSignal(HCQSignal):
   def _sleep(self, time_spent_waiting_ms:int):
     if self.is_timeline and self.owner is not None: self.owner.tasks.join()
-
-class ClangJITCompiler(Compiler):
-  def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
-
-  def compile(self, src:str) -> bytes:
-    # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
-    # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
-    target = 'x86_64' if sys.platform == 'win32' else platform.machine()
-    # on arm march means "runs on this arch and superset" instead of "optimize for this arch". x86 march == arm mcpu
-    arch = '-march=native' if platform.machine() in ('x86_64', 'AMD64') else '-mcpu=native'
-    args = [arch, f'--target={target}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib', '-fno-ident']
-    arch_args = ['-ffixed-x18'] if target == 'arm64' else []
-    obj = subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
-    return jit_loader(obj)
-
-  def disassemble(self, lib:bytes): return capstone_flatdump(lib)
 
 class CPUWorker(threading.Thread):
   def __init__(self, dev, tasks, thread_id):
@@ -71,7 +56,9 @@ class CPUComputeQueue(HWQueue):
 MAP_JIT = 0x0800
 
 class CPUProgram(HCQProgram):
-  rt_lib = ctypes.CDLL(ctypes.util.find_library('System' if OSX else 'kernel32') if OSX or WIN else 'libgcc_s.so.1')
+  rt_lib = None
+  try: rt_lib = ctypes.CDLL(ctypes.util.find_library('System' if OSX else 'kernel32') if OSX or WIN else 'libgcc_s.so.1')
+  except OSError: pass
 
   def __init__(self, dev, name:str, lib:bytes):
     if sys.platform == "win32": # mypy doesn't understand when WIN is used here
@@ -88,22 +75,27 @@ class CPUProgram(HCQProgram):
       # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
       self.mem = mmap.mmap(-1, len(lib), mmap.MAP_ANON|mmap.MAP_PRIVATE|(MAP_JIT if OSX else 0), mmap.PROT_READ|mmap.PROT_WRITE|mmap.PROT_EXEC)
 
-      if OSX: CPUProgram.rt_lib.pthread_jit_write_protect_np(False)
+      if OSX: unwrap(CPUProgram.rt_lib).pthread_jit_write_protect_np(False)
       self.mem.write(lib)
-      if OSX: CPUProgram.rt_lib.pthread_jit_write_protect_np(True)
+      if OSX: unwrap(CPUProgram.rt_lib).pthread_jit_write_protect_np(True)
 
       # __clear_cache isn't a normal libc function, but a compiler support routine found in libgcc_s for gcc and compiler-rt for clang.
       # libgcc_s comes as shared library but compiler-rt is only a bunch of static library archives which we can't directly load, but fortunately
       # it somehow found its way into libSystem on macos (likely because it used __builtin_clear_cache) and libgcc_s is ~always present on linux
       # Using ["name"] instead of .name because otherwise name is getting mangled: https://docs.python.org/3.12/reference/expressions.html#index-5
-      CPUProgram.rt_lib["__clear_cache"](ctypes.c_void_p(mv_address(self.mem)), ctypes.c_void_p(mv_address(self.mem) + len(lib)))
+      if CPUProgram.rt_lib is not None:
+        CPUProgram.rt_lib["__clear_cache"](ctypes.c_void_p(mv_address(self.mem)), ctypes.c_void_p(mv_address(self.mem) + len(lib)))
+      else:
+        # msync should be a universal POSIX way to do this
+        from tinygrad.runtime.autogen import libc
+        libc.msync(ctypes.c_void_p(mv_address(self.mem)), len(lib), libc.MS_SYNC | libc.MS_INVALIDATE)
 
       self.fxn = ctypes.CFUNCTYPE(None)(mv_address(self.mem))
 
     super().__init__(HCQArgsState, dev, name, kernargs_alloc_size=0)
 
+  @suppress_finalizing
   def __del__(self):
-    if getattr(sys, 'is_finalizing', lambda: True)(): return
     if sys.platform == 'win32': ctypes.windll.kernel32.VirtualFree(ctypes.c_void_p(self.mem), ctypes.c_size_t(0), 0x8000) #0x8000 - MEM_RELEASE
 
 class CPUAllocator(HCQAllocatorBase):
@@ -131,4 +123,5 @@ class CPUDevice(HCQCompiled):
   def __init__(self, device:str=""):
     self.tasks:queue.Queue = queue.Queue()
     CPUWorker(self, self.tasks, thread_id=0).start()
-    super().__init__(device, CPUAllocator(self), ClangRenderer(), ClangJITCompiler(), functools.partial(CPUProgram, self), CPUSignal, CPUComputeQueue)
+    compilers = [(ClangRenderer, ClangJITCompiler), (LLVMRenderer, CPULLVMCompiler)]
+    super().__init__(device, CPUAllocator(self), compilers, functools.partial(CPUProgram, self), CPUSignal, CPUComputeQueue)

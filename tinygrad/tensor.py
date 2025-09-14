@@ -8,7 +8,7 @@ from tinygrad.dtype import _from_np_dtype, _to_np_dtype
 from tinygrad.helpers import argfix, make_tuple, flatten, prod, all_int, round_up, merge_dicts, argsort, getenv, all_same, fully_flatten, dedup
 from tinygrad.helpers import IMAGE, WINO, Metadata, TRACEMETA, ceildiv, fetch, polyN, unwrap, DEBUG, is_numpy_ndarray, RANGEIFY, FUSE_ATTENTION
 from tinygrad.gradient import compute_gradient
-from tinygrad.uop.ops import smax, smin, resolve, UOp, Ops, sint, MathTrait, identity_element, all_metadata, index_to_concrete_int
+from tinygrad.uop.ops import smax, smin, resolve, UOp, Ops, sint, MathTrait, identity_element, all_metadata, index_to_concrete_int, sint_to_uop
 from tinygrad.uop.spec import tensor_uop_spec, type_verify
 from tinygrad.device import Device, Buffer
 from tinygrad.engine.realize import run_schedule
@@ -368,7 +368,7 @@ class Tensor(MathTrait):
     """
     assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
     import numpy as np
-    if self.dtype.base == dtypes.bfloat16: return self.float().numpy()
+    if self.dtype.base in { dtypes.bfloat16, *dtypes.fp8s }: return self.float().numpy()
     if 0 in self.shape: return np.empty(self.shape, dtype=_to_np_dtype(self.dtype.base))
     return self._buffer().numpy().reshape(self.shape)
 
@@ -632,6 +632,7 @@ class Tensor(MathTrait):
     """
     if stop is None: stop, start = start, 0
     dtype = kwargs.pop("dtype", dtypes.default_float if any(isinstance(x, float) for x in (start, stop, step)) else dtypes.default_int)
+    if start < (dt:=to_dtype(dtype)).min or dt.max < (stop-step): raise ValueError(f"arange [{start}, {stop}) is not representable in dtype {dtype}")
     # NOTE: this matches numpy, torch raises RuntimeError if stop-start and step have different signs
     if (output_len:=ceildiv(stop-start, step)) <= 0: return Tensor([], dtype=dtype, **kwargs)
     return (Tensor.full((output_len,), step, dtype=dtype, **kwargs)._cumalu(0, Ops.ADD) + (start - step)).cast(dtype)
@@ -1729,7 +1730,7 @@ class Tensor(MathTrait):
     ```
     """
     ret = self.cast(sum_acc_dtype(self.dtype) if dtype is None else dtype)._reduce(Ops.ADD, axis, keepdim)
-    return ret.cast(self.dtype) if dtype is None and self.dtype in (dtypes.float16, dtypes.bfloat16) else ret
+    return ret.cast(self.dtype) if dtype is None and self.dtype in (dtypes.float16, dtypes.bfloat16, *dtypes.fp8s) else ret
 
   def prod(self, axis:int|Sequence[int]|None=None, keepdim=False, dtype:DTypeLike|None=None) -> Tensor:
     """
@@ -3897,7 +3898,8 @@ class Tensor(MathTrait):
   def _one_hot_along_dim(self:Tensor, num_classes:sint, dim:int=-1) -> Tensor:
     if not dtypes.is_int(self.dtype): raise RuntimeError(f"_one_hot_along_dim expects int index tensor, getting {self.dtype}")
     offset = self.ndim - self._resolve_dim(dim) - 1
-    return self == Tensor.arange(num_classes, device=self.device, requires_grad=False).reshape((num_classes,) + (1,) * offset)
+    dt = dtypes.int64 if sint_to_uop(num_classes).overflows(dtypes.int32) else dtypes.int32
+    return self == Tensor.arange(num_classes, dtype=dt, device=self.device, requires_grad=False).reshape((num_classes,) + (1,) * offset)
 
   def one_hot(self, num_classes:int=-1) -> Tensor:
     """
@@ -4215,11 +4217,6 @@ class Tensor(MathTrait):
     return self.shape if dim is None else self.shape[dim]
 
   # ***** cast ops *****
-
-  def llvm_bf16_cast(self, dtype:DTypeLike) -> Tensor:
-    # hack for devices that don't support bfloat16
-    assert self.dtype == dtypes.bfloat16
-    return self.to("LLVM").cast(dtype)
 
   def cast(self, dtype:DTypeLike) -> Tensor:
     """
