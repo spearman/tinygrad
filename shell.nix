@@ -1,10 +1,8 @@
-with import <nixpkgs> {};
+with import <nixpkgs> { config.allowUnfree = true; };
 mkShell {
   buildInputs = [
     clang
     cmake
-    llvm
-    ocl-icd
     pipenv
     pkg-config
     pre-commit
@@ -17,12 +15,16 @@ mkShell {
     ruff
     sloccount
   ];
+  LD_LIBRARY_PATH = lib.makeLibraryPath [
+    (lib.getLib pkgs.stdenv.cc.cc)  # required for numpy
+    (lib.getLib pkgs.llvm)          # libLLVM.so
+    ocl-icd                         # libOpenCL.so
+    linuxPackages.nvidia_x11        # libcuda.so
+    cudaPackages.cudatoolkit        # libnvrtc.so
+  ];
   shellHook = ''
     mkdir -p tmp
     export TMPDIR="$(pwd)/tmp"
-    export LD_LIBRARY_PATH="${lib.getLib pkgs.stdenv.cc.cc}/lib:\
-      ${pkgs.zlib}/lib:${lib.getLib pkgs.llvm}/lib:${pkgs.ocl-icd}/lib:\
-      $LD_LIBRARY_PATH"
     export CC="clang"
   '';
 }
