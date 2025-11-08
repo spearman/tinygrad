@@ -7,11 +7,10 @@ os.environ["DEBUG"] = "2"
 
 from tinygrad import Tensor
 
-os.environ["NV"] = "1"
+#os.environ["NV"] = "1"
 #os.environ["CPU"] = "1"
-#os.environ["CLANG"] = "1"
-#os.environ["LLVM"] = "1"
-#os.environ["GPU"] = "1"
+os.environ["CUDA"] = "1"
+#os.environ["CL"] = "1"
 
 x = Tensor.randn(4, 3, 2)
 y = Tensor.randn(2)
