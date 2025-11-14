@@ -1,5 +1,6 @@
 import os, sys, pickle, time, re
 import numpy as np
+if "JIT_BATCH_SIZE" not in os.environ: os.environ["JIT_BATCH_SIZE"] = "0"
 
 from tinygrad import fetch, Tensor, TinyJit, Context, GlobalCounters, Device, dtypes
 from tinygrad.helpers import DEBUG, getenv
@@ -38,7 +39,7 @@ def compile(onnx_file):
   np.testing.assert_equal(test_val, ret, "JIT run failed")
   print("jit run validated")
 
-  # checks from compile2
+  # check gated read_image usage
   kernel_count = 0
   read_image_count = 0
   gated_read_image_count = 0
