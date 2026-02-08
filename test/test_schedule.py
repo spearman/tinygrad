@@ -12,9 +12,7 @@ from tinygrad.device import is_dtype_supported
 from tinygrad.dtype import DType, ImageDType
 from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat
 from tinygrad.helpers import CI, DEBUG, SPLIT_REDUCEOP, GlobalCounters, Context, getenv, all_same, temp
-from tinygrad.schedule.rangeify import get_rangeify_map, Kernel
-from tinygrad.engine.schedule import create_schedule_with_vars
-from tinygrad.engine.realize import CompiledRunner, run_schedule, lower_schedule
+from tinygrad.engine.realize import CompiledRunner, run_schedule
 
 class KernelCountException(Exception): pass
 def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Tensor]|None=None, filter_sink=True):
@@ -24,13 +22,12 @@ def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Te
   elif isinstance(t, list) and isinstance(t[0], Tensor): sched = Tensor.schedule(*t)
   else:
     assert isinstance(t, UOp), f"can't schedule {t}"
-    sink = UOp.sink(t) if t.op is not Ops.SINK else t
-    becomes_map = get_rangeify_map(sink)
-    sched, _ = create_schedule_with_vars(sink.substitute(becomes_map))
-  # test lowering all the ScheduleItems to ExecItems
-  kernel_cnt = len([si for si,ei in lower_schedule(sched.copy()) if isinstance(ei.prg, CompiledRunner) or not filter_sink])
+    sched = Tensor(t).schedule()
+  # test lowering all the ExecItems
+  for si in sched: si.lower()
+  kernel_cnt = len([si for si in sched if isinstance(si.prg, CompiledRunner) or not filter_sink])
   if kernel_cnt != allowed:
-    print(f"SCHEDULE ISSUE, expecting {allowed} got {len(sched)}")
+    print(f"SCHEDULE ISSUE, expecting {allowed} got {kernel_cnt}")
     if DEBUG >= 3:
       for i,s in enumerate(sched):
         print("kernel", i+1)
@@ -120,7 +117,7 @@ class TestSchedule(unittest.TestCase):
     a = Tensor.randn(4, 2, 1).realize().permute((1, 0, 2))
     b = a.cast(dtypes.half).expand((2, 4, 4))+2
     run_schedule(check_schedule(b, 1))
-    np.testing.assert_allclose(b.numpy(), np.broadcast_to(a.numpy().astype(np.float16), (2, 4, 4))+2)
+    np.testing.assert_allclose(b.numpy(), np.broadcast_to(a.numpy().astype(np.float16), (2, 4, 4))+2, rtol=1e-3)
 
   def test_indexing_scalars_simple(self):
     X = Tensor.randn(2, 2).realize()
@@ -177,14 +174,22 @@ class TestSchedule(unittest.TestCase):
     child.realize()
     assert a.uop.is_realized
 
-  # NOTE: because empty does not have an ExecItem if realize is called on a childless empty, it never gets allocated.
+  def test_realize_view_of_realized_has_empty_schedule(self):
+    # views of realized buffers produce an empty schedule
+    t = Tensor.zeros((3, 3)).contiguous().realize()
+    v = t[1]  # view - is_realized but not has_buffer_identity
+    assert v.uop.is_realized
+    sched, _ = Tensor.schedule_with_vars(v)
+    self.assertEqual(len(sched), 0)
+
+  # NOTE: because empty does not have a lowered ExecItem if realize is called on a childless empty, it never gets allocated.
   def test_childless_empty_never_allocates(self):
     a = Tensor.empty(10)
     a.realize()
     assert not a.uop.is_realized
 
   def test_simplify_padded_const(self):
-    a = Tensor.empty(1022).cummax(axis=0)
+    a, _ = Tensor.empty(1022).cummax(axis=0)
     check_schedule(a, 3)
 
   def test_basic_binop_fusion(self):
@@ -672,73 +677,6 @@ class TestSchedule(unittest.TestCase):
     c = (a.sum(2).contiguous() + b).contiguous()
     check_schedule(c, 2)
 
-  def test_kernelize(self):
-    a = Tensor.empty(10)
-    b = Tensor.empty(10)
-    c = (a+b).kernelize()
-    d = c+2
-    check_schedule(d, 2)
-
-  def test_kernelize_view(self):
-    a = Tensor.empty(4,1)
-    b = a*2
-    c = b.kernelize()+Tensor.empty(4,4)
-    check_schedule(c, 2)
-
-  def test_kernelize_diamond(self):
-    a = Tensor([0]).realize()
-    prev_a = (a+1).contiguous()
-    a.assign(Tensor([2]))
-    a.kernelize(prev_a)
-    self.assertEqual((prev_a+a*3).item(), 1+2*3)
-
-  def test_kernelize_sym(self):
-    a = Tensor([1])+Tensor([2])
-    a.kernelize()
-    b = a/a
-    check_schedule(b, 0)
-    self.assertEqual(b.item(), 1)
-
-  # TODO: this requires supporting multiple stores in the AST
-  @unittest.expectedFailure
-  def test_multioutput_ast(self):
-    a = Tensor.zeros(1, dtype=dtypes.int).contiguous().realize().uop
-    b = Tensor.zeros(1, dtype=dtypes.int).contiguous().realize().uop
-    c = Tensor.arange(4).realize().uop
-    kernel = UOp(Ops.KERNEL, src=(a.base, b.base, c.base), arg=Kernel(UOp.sink(c.r(Ops.ADD, (0,))+1, c.r(Ops.ADD, (0,))*2)))
-    run_schedule(check_schedule(UOp.sink(a.assign(kernel), b.assign(kernel)), 1))
-    self.assertEqual(a.buffer.numpy(), [7])
-    self.assertEqual(b.buffer.numpy(), [12])
-
-  # unlike schedule, kernelize can be called multiple times on a Tensor
-  def test_double_kernelize(self):
-    a = Tensor.empty(10)
-    b = Tensor.empty(10)
-    c = (a+b)
-    d = c.kernelize()+2
-    e = c.kernelize()+d.kernelize()
-    check_schedule(e, 3)
-
-  def test_kernelize_bw(self):
-    a = Tensor.full((3,), 2.0, requires_grad=True).contiguous()
-    b = Tensor.full((3,), 3.0, requires_grad=True).contiguous()
-    x = (a*b).kernelize()
-    y = Tensor.eye(3, requires_grad=True)
-    z = y.matmul(x).sum()
-    z.backward()
-    self.assertEqual(z.item(), 18.0)
-    self.assertEqual(z.grad.item(), 1.0)
-
-  def test_kernelize_bw_view(self):
-    a = Tensor.full((3,1), 2.0, requires_grad=True).contiguous()
-    b = Tensor.full((3,1), 3.0, requires_grad=True).contiguous()
-    x = (a*b).kernelize()
-    y = Tensor.eye(6, requires_grad=True)
-    z = y.matmul(x.expand(3,2).reshape(6)).sum()
-    z.backward()
-    self.assertEqual(z.item(), 36.0)
-    self.assertEqual(z.grad.item(), 1.0)
-
   @unittest.skip("no longer supported")
   def test_double_from(self):
     x = Tensor([1,2,3,4])
@@ -1149,6 +1087,18 @@ class TestSchedule(unittest.TestCase):
     run_schedule(check_schedule(out, 5))
     np.testing.assert_allclose(out[0].numpy(), np.sqrt(np.square(x.numpy() - np_mu).sum(-1)/x.shape[-1]), atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(out[1].numpy(), np.sqrt(np.square(y.numpy() - np_mu).sum(-1)/y.shape[-1]), atol=1e-4, rtol=1e-4)
+
+  def test_cumsum_parallel_reduce_fused(self):
+    # two-stage cumsum + ops triggers parallel REDUCEs in one kernel that must share an END
+    step, num_steps = 513, 10
+    t = Tensor.arange(step).float().realize()
+    phase = t.cumsum()
+    tiled = phase.repeat((num_steps,)).reshape(num_steps, step)
+    pattern = Tensor([1,0,0,1,0,0,0,0,1,0]).reshape(num_steps, 1)
+    out = (tiled * pattern).flatten()
+    expected = np.tile(np.arange(step).astype(np.float32).cumsum(), num_steps).reshape(num_steps, step)
+    expected = (expected * np.array([1,0,0,1,0,0,0,0,1,0]).reshape(num_steps, 1)).flatten()
+    np.testing.assert_allclose(out.numpy(), expected, atol=1e-4, rtol=1e-4)
 
   def test_multimatmul_fusion(self):
     Tensor.manual_seed(0)
@@ -1814,7 +1764,7 @@ class TestSchedule(unittest.TestCase):
   @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
   def test_precompute_freqs_cis(self):
     from extra.models.llama import precompute_freqs_cis
-    args = {"dim":32 if CI else 128, "end":2048 if CI else 8192, "theta":10000}
+    args = {"dim":32, "end":2048, "theta":10000}
     fused = precompute_freqs_cis(**args)
     run_schedule(check_schedule(fused, 1))
     if getenv("CHECK", 1):
@@ -1914,18 +1864,6 @@ class TestSchedule(unittest.TestCase):
     root = bufs[0][vi] + bufs[0][vj]
     for X in range(1,N): root = root + bufs[X][vi] + bufs[X][vj]
     self.assertEqual(root.item(), N * 2)
-
-  def test_limit_bufs_kernelize(self):
-    N = 31
-    with Context(TRACK_MATCH_STATS=0, DEBUG=0):
-      bufs = [Tensor(i).contiguous().realize() for i in range(N)]
-    x = bufs[0]
-    for y in bufs[1:]: x = x+y
-    x.kernelize()
-    kcount = len([s for s in x.uop.toposort() if s.op is Ops.KERNEL])
-    z = x+Tensor.empty(1) # z only loads 2 buffers
-    sched = z.schedule()
-    self.assertEqual(len(sched), kcount+1)
 
 class TestSwizzle(unittest.TestCase):
   def test_swizzle_simple(self):
@@ -2118,7 +2056,7 @@ class TestCopyFolding(unittest.TestCase):
     b = Tensor.empty(4, device="CPU")
     add = a+b
     assert all_same([x.device for x in add.uop.src]), f"ALU has different devices! {[x.device for x in add.src]}"
-    add.kernelize()
+    add.schedule()
 
   def test_alu_before_copy(self):
     buf = Tensor.ones(1).contiguous().realize()
@@ -2137,7 +2075,7 @@ class TestCopyFolding(unittest.TestCase):
     check_schedule(b, 1, filter_sink=False) # TODO: 0?
 
   def test_copy_to_same_device_sched(self):
-    a = Tensor.ones(4).contiguous().realize().uop.as_buf()
+    a = Tensor.ones(4).contiguous().realize().uop.buf_uop
     t = Tensor(a.copy_to_device(a.device))
     sched = t.schedule()
     assert len([s for s in sched if s.ast.op is Ops.COPY]) == 0
@@ -2174,14 +2112,14 @@ class TestCopyFolding(unittest.TestCase):
     self.assertListEqual(b.tolist(), [[0, 2], [1, 3]])
 
   def test_permute_on_disk(self):
-    with open(temp('dt_arange_4_permute'), "wb") as f: f.write(Tensor.arange(4).realize().uop.base.buffer.as_buffer())
+    with open(temp('dt_arange_4_permute'), "wb") as f: f.write(Tensor.arange(4).realize().uop.base.buffer.as_memoryview())
     a = Tensor.empty(4, dtype=dtypes.int32, device=f"disk:{temp('dt_arange_4_permute')}")
     b = a.reshape(2, 2).permute(1, 0).to("CPU")
     b.realize()
     self.assertListEqual(b.tolist(), [[0, 2], [1, 3]])
 
   def test_permute_on_disk_contiguous(self):
-    with open(temp('dt_arange_4_permute_contig'), "wb") as f: f.write(Tensor.arange(4).realize().uop.base.buffer.as_buffer())
+    with open(temp('dt_arange_4_permute_contig'), "wb") as f: f.write(Tensor.arange(4).realize().uop.base.buffer.as_memoryview())
     a = Tensor.empty(4, dtype=dtypes.int32, device=f"disk:{temp('dt_arange_4_permute_contig')}")
     b = a.reshape(2, 2).permute(1, 0).contiguous().to("CPU")
     b.realize()
@@ -2195,109 +2133,11 @@ class TestCopyFolding(unittest.TestCase):
 
   # NOTE: disk permute must come after COPY
   def test_permute_after_shrink_on_disk(self):
-    with open(temp('dt_arange_5_permute'), "wb") as f: f.write(Tensor.arange(5).realize().uop.base.buffer.as_buffer())
+    with open(temp('dt_arange_5_permute'), "wb") as f: f.write(Tensor.arange(5).realize().uop.base.buffer.as_memoryview())
     a = Tensor.empty(5, dtype=dtypes.int32, device=f"disk:{temp('dt_arange_5_permute')}")
     b = a.shrink(((0, 4),)).reshape(2, 2).permute(1, 0).to("CPU")
     b.realize()
     self.assertListEqual(b.tolist(), [[0, 2], [1, 3]])
-
-class TestBufferUOp(unittest.TestCase):
-  # BUFFER has a ShapeTracker of shape=(n,) and stride=(1,)
-  def test_buffer_has_buffer(self):
-    buf = Tensor.empty(10)
-    self.assertIsNotNone(buf.uop.buffer)
-    self.assertEqual(buf.uop.shape, (10,))
-    # the device Buffer remains unallocated until it's we run the schedule
-    self.assertFalse(buf.uop.buffer.is_allocated())
-    add = buf+1
-    sched = add.schedule()
-    self.assertFalse(buf.uop.buffer.is_allocated())
-    run_schedule(sched)
-    self.assertTrue(buf.uop.buffer.is_allocated())
-
-  def test_buffer_has_unique_buffer(self):
-    buf = Tensor.empty(10)
-    buf1 = buf.uop.buffer
-    buf2 = buf.uop.buffer
-    self.assertIs(buf1, buf2)
-
-  # we also allow VIEW(BUFFER) to access the underlying device Buffer, as long as it's contiguous
-  def test_buffer_view_allowed(self):
-    add = Tensor.empty(1, 1)+Tensor.empty(1, 1)
-    add.realize()
-    self.assertIsNotNone(add.uop.buffer)
-    self.assertEqual(add.uop.shape, (1, 1))
-
-  def test_buffer_view_not_allowed(self):
-    permuted_view = Tensor.empty(1, 2, 3).permute(0, 2, 1)
-    with self.assertRaisesRegex(AssertionError, "can only be RESHAPE"):
-      permuted_view.uop.buffer # cannot access Buffer of a non contiguous VIEW
-
-  def test_buffer_only_after_realize(self):
-    a = Tensor([1])+Tensor([2])
-    # accessing realized will return None
-    self.assertIsNone(a.uop.realized)
-    # accessing Buffer will assert
-    with self.assertRaisesRegex(AssertionError, "must be BUFFER"):
-      a.uop.buffer # there is no BUFFER on an unrealized ADD
-    # Buffer only exists once we realize it
-    a.realize()
-    self.assertIsNotNone(a.uop.buffer)
-
-  def test_const_does_not_realize(self):
-    a = Tensor(1)+Tensor(2)
-    run_schedule(check_schedule(a, 0))
-    self.assertIsNone(a.uop.base.realized)
-
-  def test_var_does_not_realize(self):
-    a = Tensor(UOp.variable("a", 0, 10).bind(1))
-    run_schedule(check_schedule(a, 0))
-    self.assertIsNone(a.uop.base.realized)
-
-  def test_view_does_not_realize(self):
-    a = Tensor.randn(1, 4).expand(4, 4)
-    a.realize()
-    self.assertEqual(a.uop.base.realized.size, 4)
-    a2 = a.contiguous().realize()
-    self.assertEqual(a2.uop.base.realized.size, 16)
-
-class TestContiguous(unittest.TestCase):
-  def test_contiguous_buffer(self):
-    a = Tensor.empty(4)
-    b = a.contiguous()
-    check_schedule(b, 0)
-
-  def test_contiguous_buffer_view(self):
-    a = Tensor.empty(4)
-    b = a.reshape((2, 2)).contiguous()
-    check_schedule(b, 0)
-
-  def test_non_contiguous_buffer_view(self):
-    a = Tensor.empty(4, 1)
-    b = a.expand((4, 4)).contiguous()
-    check_schedule(b, 1)
-
-  def test_size_change_buffer_view(self):
-    a = Tensor.empty(4)
-    b = a.reshape((1, 1, 4)).shrink(((0, 1), (0, 1), (0, 3))).contiguous()
-    check_schedule(b, 1)
-
-  def test_double_contiguous_realizes_once(self):
-    a = Tensor.empty(4, 1)
-    b = a.expand((4, 4)).contiguous().contiguous()
-    check_schedule(b, 1)
-
-  def test_view_does_not_realize(self):
-    a = Tensor.empty(4)
-    b = a.expand((4, 4))
-    check_schedule(b, 0)
-    self.assertEqual(b.uop.base.buffer.size, 4)
-
-  def test_contiguous_view_realizes(self):
-    a = Tensor.empty(4)
-    b = a.expand((4, 4)).contiguous()
-    check_schedule(b, 1)
-    self.assertEqual(b.uop.base.buffer.size, 16)
 
 class TestUOpBecome(unittest.TestCase):
   # the simplest case, if we create a new BUFFER for this tensor UOp

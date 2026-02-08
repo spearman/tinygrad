@@ -1,29 +1,44 @@
 import unittest
 import numpy as np
 from tinygrad import Tensor, GlobalCounters, dtypes, nn, Device, Variable
-from tinygrad.helpers import CI, Context, getenv
+from tinygrad.helpers import Context, getenv, EMULATE
 from tinygrad.engine.realize import run_schedule
-from tinygrad.engine.realize import CompiledRunner, ExecItem, get_program
+from tinygrad.engine.realize import CompiledRunner, get_program
+from tinygrad.engine.schedule import ExecItem
 from tinygrad.uop.ops import Ops
+from tinygrad.renderer import Estimates
+from tinygrad.renderer.ptx import PTXRenderer
 
 class TestArange(unittest.TestCase):
-  def _get_flops(self, N):
+  def _get_flops(self, tensor, desired):
     GlobalCounters.reset()
-    tt = Tensor.arange(N)
-    sched = tt.schedule()
+    sched = tensor.schedule()
     self.assertEqual(len(sched), 1)
-    p = get_program(sched[-1].ast)
-    ExecItem(CompiledRunner(p), [tt.uop.buffer]).run()
-    np.testing.assert_equal(tt.numpy(), np.arange(N))
+    p = get_program(sched[-1].ast, renderer=Device[Device.DEFAULT].renderer)
+    ExecItem(sched[-1].ast, [tensor.uop.buffer], prg=CompiledRunner(p)).run()
+    np.testing.assert_equal(tensor.numpy(), desired)
     return p.estimates.ops
 
-  def test_complexity(self):
-    self.assertEqual(self._get_flops(256), 0)
-    self.assertEqual(self._get_flops(2560), 0)
+  def test_arange_complexity(self):
+    self.assertEqual(self._get_flops(Tensor.arange(256), np.arange(256)), 0)
+    self.assertEqual(self._get_flops(Tensor.arange(2560), np.arange(2560)), 0)
 
   def test_arange_cat(self):
     t = Tensor.arange(2, dtype=dtypes.int)+Tensor([3])
     self.assertEqual(t.cat(t).tolist(), [3, 4, 3, 4])
+
+  def test_eye_complexity(self):
+    with Context(NOOPT=1):
+      # NOTE: not every backend supports CMPEQ
+      self.assertLessEqual(self._get_flops(Tensor.eye(2560).contiguous(), np.eye(2560)), 2*2560*2560)
+
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX indexing is weird")
+  def test_tri_complexity(self):
+    with Context(NOOPT=1):
+      t = Tensor.ones(256, 256).contiguous().realize()
+      sched = t.triu().schedule()
+      p = get_program(sched[-1].ast, renderer=Device[Device.DEFAULT].renderer)
+      self.assertLessEqual(Estimates.from_uops(p.uops).ops, 4 * 256 * 256)
 
 DSET, DDIM = 2048, 32
 
@@ -79,10 +94,9 @@ class TestIndexing(unittest.TestCase):
       X = dataset[idxs]
       assert X.shape == (4,DDIM)
       sched = X.schedule()
-      # TODO: enable these asserts when the scheduler can handle this
-      #self.assertEqual(len(sched), 1)
+      self.assertEqual(len(sched), 1)
       run_schedule(sched)
-      #assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops}"
+      assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops}"
     np.testing.assert_allclose(real_index, X.numpy())
 
   def test_index_fused(self, noopt=1):
@@ -129,7 +143,7 @@ class TestIndexing(unittest.TestCase):
 
   def test_llama_embedding(self, noopt=1, op_limit=65536):
     # llama3 is 128256
-    vocab_size, embed_size = (10, 3) if CI else (32000, 4096)
+    vocab_size, embed_size = (10, 3)
     emb = nn.Embedding(vocab_size, embed_size)
     emb_w = emb.weight.numpy()
     x = Tensor([1,2,3,4])
@@ -147,7 +161,60 @@ class TestIndexing(unittest.TestCase):
       # TODO: reshape to match torch, should we do this in nn?
       np.testing.assert_allclose(z.numpy().reshape(4, embed_size), torch_z.detach().numpy(), atol=1e-8, rtol=1e-8)
   # at least the arange is being fused
-  def test_llama_embedding_opt(self): self.test_llama_embedding(0, 1_736_704_000 if CI else 5_898_240_000)
+  def test_llama_embedding_opt(self): self.test_llama_embedding(0, 1_736_704_000)
+
+  # NOTE: call doesn't work with SPEC=2
+  @unittest.skipIf(Device.DEFAULT not in ("CPU", "AMD"), "atomics only on AMD/CPU")
+  @Context(USE_ATOMICS=1, SPEC=1)
+  def test_llama_8b_embedding_backward(self):
+    from tinygrad.renderer.cstyle import CStyleLanguage
+    if Device.DEFAULT == "CPU" and not isinstance(Device["CPU"].renderer, CStyleLanguage): self.skipTest("CPU needs Clang renderer")
+    vocab_size, embed_size = 1000, 128
+    bs, seqlen = 4, 256
+    idx = Tensor.randint(bs, seqlen, high=vocab_size)
+    emb = nn.Embedding(vocab_size, embed_size)
+    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    gt = Tensor.zeros(bs, seqlen, embed_size)
+    Tensor.realize(idx, emb.weight, gt)
+    GlobalCounters.reset()
+    loss = (emb(idx)-gt).square().sum()
+    loss.backward()
+    emb.weight.grad.realize()
+    bwd_ops = GlobalCounters.global_ops
+    print(f"embedding bwd: {GlobalCounters.kernel_count} kernels, {bwd_ops:,} ops")
+    self.assertLess(bwd_ops, bs*seqlen*embed_size*20, f"backward ops {bwd_ops:,} should be less than 20 per with atomic scatter-add")
+    # correctness check
+    expected_grad = np.zeros((vocab_size, embed_size), dtype=np.float32)
+    for i in idx.flatten().numpy(): expected_grad[i] += 2
+    np.testing.assert_allclose(emb.weight.grad.numpy(), expected_grad, rtol=1e-5, atol=1e-5)
+
+  # ~10x overhead in fused matmul bw with rope in bf16 vs float16
+  @unittest.skipUnless(Device.DEFAULT == "AMD" or (Device.DEFAULT == "NULL" and EMULATE.value.startswith("AMD")), "tests AMD bf16 cast overhead")
+  def base_test_llama_8b_rope_backward(self, dtype, ops_scale):
+    from extra.models.llama import precompute_freqs_cis, apply_rotary_emb
+    Tensor.training = True
+    bs, seqlen, dim, n_heads = 1, 512, 256, 4
+    head_dim = dim // n_heads
+    x = Tensor.randn(bs, seqlen, dim, dtype=dtype)
+    wq = Tensor.randn(dim, dim, dtype=dtype, requires_grad=True)
+    freqs_cis = precompute_freqs_cis(head_dim, seqlen).cast(dtype)
+    Tensor.realize(x, wq, freqs_cis)
+    xq = (x @ wq.T)
+    # main llama does not fuse it
+    #xq = xq.contiguous_backward()
+    xq = xq.reshape(bs, seqlen, n_heads, head_dim)
+    xq_rope, _ = apply_rotary_emb(xq, xq, freqs_cis)
+    xq_rope.sum().backward()
+    sched = wq.grad.schedule()
+    assert len(sched) == 1, f"expected one kernel for backward, got: {len(sched)}"
+    prg = sched[0].lower().prg.p
+    bwd_ops = prg.estimates.ops
+    expected_ops = bs*seqlen*dim*dim*ops_scale
+    print(f"rope matmul bwd ({dtype}): {GlobalCounters.kernel_count} kernels, {bwd_ops:,} ops")
+    self.assertLess(bwd_ops, expected_ops, f"rope bwd ops {bwd_ops:,} should be < {ops_scale} per (got {bwd_ops/(bs*seqlen*dim*dim):.1f})")
+
+  def test_llama_8b_rope_backward_f16(self): self.base_test_llama_8b_rope_backward(dtypes.float16, 1)
+  def test_llama_8b_rope_backward_bf16(self): self.base_test_llama_8b_rope_backward(dtypes.bfloat16, 11)
 
 if __name__ == "__main__":
   unittest.main()

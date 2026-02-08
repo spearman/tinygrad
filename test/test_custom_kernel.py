@@ -1,5 +1,5 @@
 import unittest
-from tinygrad import Tensor, UOp, Context
+from tinygrad import Tensor, UOp
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import KernelInfo, AxisType
 
@@ -52,7 +52,7 @@ def flip_contract_kernel(dest:UOp, src:UOp):
   j = UOp.range(dest.shape[1], 1, AxisType.UPCAST)
   vec = src[i, j].contract(j)
   store = UOp.group(*[dest[i, k].store(vec.gep(3-k)) for k in range(4)])
-  return store.end(i).sink(arg=KernelInfo(name=f"flip_contract_{dest.size}", opts_to_apply=()))
+  return store.end(i, j).sink(arg=KernelInfo(name=f"flip_contract_{dest.size}", opts_to_apply=()))
 
 def slice_sum_kernel(dest:UOp, src:UOp):
   G = UOp.range(src.shape[0], 0)
@@ -88,13 +88,13 @@ def simple_qkv_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
 # **** backward callbacks ****
 
 def backward_gemm(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
-  out, a, b = kernel.src
+  out, a, b = kernel.src[1:]
   grad_a = (Tensor(gradient) @ Tensor(b).T).uop
   grad_b = (Tensor(a).T @ Tensor(gradient)).uop
   return (None, grad_a, grad_b)
 
 def backward_gemm_custom(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
-  out, a, b = kernel.src
+  out, a, b = kernel.src[1:]
   grad_a = Tensor.empty_like(Tensor(a)).custom_kernel(Tensor(gradient), Tensor(b).T, fxn=custom_gemm)[0].uop
   grad_b = Tensor.empty_like(Tensor(b)).custom_kernel(Tensor(a).T, Tensor(gradient), fxn=custom_gemm)[0].uop
   return (None, grad_a, grad_b)
@@ -102,6 +102,11 @@ def backward_gemm_custom(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
 # **** tests ****
 
 class TestCustomKernel(unittest.TestCase):
+  def test_empty(self):
+    a = Tensor.empty(1)
+    a = Tensor.custom_kernel(a, fxn=lambda _: UOp.sink(arg=KernelInfo()))[0]
+    a.realize()
+
   def test_simple(self):
     a = Tensor.ones(16, 16).contiguous()
     b = Tensor.ones(16, 16).contiguous()
@@ -111,6 +116,25 @@ class TestCustomKernel(unittest.TestCase):
 
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
+
+  def test_simple_sharded(self):
+    devs = ("CPU:0", "CPU:1")
+
+    a = Tensor.ones(16, 16).contiguous().shard(devs, axis=0)
+    b = Tensor.ones(16, 16).contiguous().shard(devs, axis=0)
+    # ugly construction to get a sharded empty tensor
+    c = Tensor(Tensor.empty(8, 16, device=devs).uop.multi(0), device=devs)
+    c = Tensor.custom_kernel(c,a,b, fxn=custom_elementwise_add_kernel)[0]
+    out = c.flatten().tolist()
+    assert all(x == 2 for x in out), "all 2"
+
+  def test_sharded_add_one(self):
+    # PYTHON backend explicitly checks for OOB access for wrong multi shape regression
+    devs = ("PYTHON:0", "PYTHON:1")
+    a = Tensor.ones(4, 4).contiguous().shard(devs, axis=0)
+    c = Tensor(Tensor.empty(2, 4, device=devs).uop.multi(0), device=devs)
+    c = Tensor.custom_kernel(c, a, fxn=custom_add_one_kernel)[0]
+    assert (c == 2).all().item()
 
   def test_multioutput(self):
     a = Tensor.full((16, 16), 3.).contiguous()
@@ -150,9 +174,14 @@ class TestCustomKernel(unittest.TestCase):
     self.assertTrue((b_p1 == 3).all().item())
 
   def test_sum(self):
-    # TODO: this only works for float, and silently fails with int
     a = Tensor([1.0, 2, 3, 4, 5])
     tst = Tensor.empty(1)
+    b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
+    self.assertEqual(b.item(), 15)
+
+  def test_sum_int(self):
+    a = Tensor([1, 2, 3, 4, 5])
+    tst = Tensor.empty(1, dtype=a.dtype)
     b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
     self.assertEqual(b.item(), 15)
 
@@ -172,9 +201,18 @@ class TestCustomKernel(unittest.TestCase):
     err = (tst - (a@b)).square().max()
     self.assertLess(err.item(), 1e-6)
 
+  def test_gemm_multi(self):
+    devs = ("CPU:0", "CPU:1")
+    N = 16
+    a = Tensor.randn(N, N).shard_(devs, axis=0)
+    b = Tensor.randn(N, N).to(devs)
+    c = Tensor(Tensor.empty(N//2, N, device=devs).uop.multi(0), device=devs)
+    tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm)[0]
+    err = (tst - (a@b)).square().max()
+    self.assertLess(err.item(), 1e-6)
+
   def test_gemm_backward_custom(self): self.test_gemm_backward(True)
   # NOTE: grad_fxn doesn't work with pyrender
-  @Context(SPEC=1)
   def test_gemm_backward(self, custom_backward_gemm=False):
     N = 4
     a_rand = Tensor.randn(N, 8)
@@ -216,6 +254,40 @@ class TestCustomKernel(unittest.TestCase):
     Tensor.realize(O_custom, O_ref)
     err = (O_custom - O_ref).square().max()
     self.assertLess(err.item(), 1e-6)
+
+  def test_multi_after_schedule_order(self):
+    """Test correct scheduling order when custom_kernel has multiple outputs.
+
+    custom_kernel with 4 arguments creates 4 AFTERs from the same kernel.
+    The custom_kernel depends on both A2 and B2, so it must be scheduled after both.
+    E only depends on A2, so E can run before custom_kernel finishes waiting for B2.
+
+    Expected schedule order: [A2, B2, E, custom_addmul, final_sum]
+    The custom_addmul kernel should be at index 3.
+    """
+    from tinygrad.engine.schedule import create_schedule
+    from tinygrad.schedule.rangeify import get_rangeify_map
+
+    A, B = Tensor.empty(4, 4), Tensor.empty(4, 4)
+    A2 = (A + 1).contiguous()                      # kernel 0: depends on A
+    B2 = (B * 2).contiguous()                      # kernel 1: depends on B
+    C, D = Tensor.empty(4, 4), Tensor.empty(4, 4)
+    C, D, _, _ = Tensor.custom_kernel(C, D, A2, B2, fxn=custom_elementwise_addmul_kernel)  # depends on A2 AND B2
+    E = (A2 * 3).contiguous()                      # kernel 2: depends only on A2
+    result = (C + D + E).sum()                     # kernel 3: custom_addmul, then kernel 4: sum
+
+    big_sink = result.uop.sink()
+    tensor_map = get_rangeify_map(big_sink)
+    sched_sink = big_sink.substitute(tensor_map)
+    schedule, _ = create_schedule(sched_sink)
+
+    # Find the custom_addmul kernel position
+    custom_idx = next((i for i, item in enumerate(schedule)
+                       if hasattr(item.ast, "arg") and hasattr(item.ast.arg, "name")
+                       and "custom_addmul" in item.ast.arg.name), None)
+
+    self.assertIsNotNone(custom_idx, "custom_addmul kernel not found in schedule")
+    self.assertEqual(custom_idx, 3, f"custom_addmul should be at index 3, got {custom_idx}")
 
 if __name__ == '__main__':
   unittest.main()

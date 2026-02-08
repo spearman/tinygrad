@@ -20,7 +20,7 @@ class TestPickle(unittest.TestCase):
     self.assertEqual(pm2.rewrite(sink).key, tt.key)
 
   def test_pickle_main_pattern_matcher(self):
-    from tinygrad.codegen.late.devectorizer import sym
+    from tinygrad.uop.symbolic import sym
     ssym = pickle.dumps(sym)
     dsym = pickle.loads(ssym)
     self.assertEqual(dsym.patterns[0][0].location, sym.patterns[0][0].location)
@@ -76,7 +76,7 @@ class TestPickle(unittest.TestCase):
     del a
     del buffer
     a2:UOp = pickle.loads(s)
-    self.assertListEqual(a2.base.realized.as_buffer().cast("I").tolist(), [0, 1, 2, 3])
+    self.assertListEqual(a2.base.realized.as_memoryview().cast("I").tolist(), [0, 1, 2, 3])
 
   def test_pickle_unrealized_tensor(self):
     t = Tensor.ones(10, 10)
