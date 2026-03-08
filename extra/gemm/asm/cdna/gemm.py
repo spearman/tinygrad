@@ -1,47 +1,57 @@
 import atexit, functools
-from tinygrad.runtime.support.compiler_amd import HIPCompiler
 from tinygrad import Tensor, Device, dtypes
+from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
 from tinygrad.renderer import Estimates
-from tinygrad.helpers import getenv, all_same, dedup
-from extra.gemm.asm.cdna.asm import build_kernel, GEMM_ARGS
+from tinygrad.helpers import getenv, all_same, DEBUG
+from extra.gemm.asm.cdna.asm import build_kernel, TILE_M, TILE_N, TILE_K, NUM_WG
 
 # ** CDNA4 assembly gemm
 
 WORKGROUP_SIZE = 256
 
-def custom_asm_gemm(C:UOp, A:UOp, B:UOp, dname:str, arch:str, wg:int) -> UOp:
+@functools.cache
+def custom_asm_gemm(C:UOp, A:UOp, B:UOp, dname:str) -> UOp:
   batch, M, K = A.shape
   K2, N = B.shape[(1 if B.ndim == 3 else 0):]
   assert K == K2
   lidx = UOp.special(WORKGROUP_SIZE, "lidx0")
-  gidx = UOp.special(wg, "gidx0")
-  k = build_kernel(batch, M, N, K, A.dtype.base)
-  sink = UOp.sink(C.base, A.base, B.base, lidx, gidx,
-                  arg=KernelInfo(name=k.name, estimates=Estimates(ops=2*batch*M*N*K, mem=(batch*M*K + K*N + batch*M*N)*2)))
-  binary = HIPCompiler(arch).compile(k.to_asm())
-  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg=dname), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-                               UOp(Ops.SOURCE, arg=k.to_text()), UOp(Ops.BINARY, arg=binary)))
+  gidx = UOp.special(NUM_WG, "gidx0")
+  insts = build_kernel(batch, M, N, K, A.dtype.base)
+  lds = UOp(Ops.DEFINE_LOCAL, dtypes.uint8.ptr(size=133_120, addrspace=AddrSpace.LOCAL), (), 'lds')
+  sink = UOp.sink(C.base, A.base, B.base, lds, lidx, gidx,
+                  arg=KernelInfo(name=f"gemm_{batch}_{M}_{N}_{K}", estimates=Estimates(ops=2*batch*M*N*K, mem=(batch*M*K + K*N + batch*M*N)*2)))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg=dname),
+                                UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
 
 counters = {"used":0, "todos":[]}
 def todo(msg:str) -> bool: counters["todos"].append(msg); return False
-atexit.register(lambda: print(f'asm_gemm: {counters["used"]} used, {len(counters["todos"])} not used'))
+def _asm_gemm_report():
+  print(f'asm_gemm: {counters["used"]} used, {len(counters["todos"])} not used')
+  if DEBUG >= 2 and counters["todos"]:
+    from collections import Counter
+    for msg, cnt in Counter(counters["todos"]).most_common(): print(f'  {cnt:3d}x {msg}')
+atexit.register(_asm_gemm_report)
 
 def can_use_asm_gemm(a:Tensor, b:Tensor) -> bool:
   if a.dtype != b.dtype: return todo(f"dtypes must match {a.dtype} != {b.dtype}")
   if a.dtype not in {dtypes.bfloat16, dtypes.float16}: return todo(f"only bfloat16/float16, got {a.dtype}")
-  # only sharding on the batch is tested, others might work too
-  if isinstance(a.device, tuple) and not (a.ndim == 3 and a.uop.axis == 0 and b.uop.axis is None):
-    return todo(f"sharding mismatch a.ndim={a.ndim} a.uop.axis={a.uop.axis} b.uop.axis={b.uop.axis}")
   batch, M, K = (1, *a.shape) if a.ndim == 2 else a.shape
   N = b.shape[1]
   if isinstance(a.device, tuple):
-    batch //= len(a.device)
+    if a.ndim == 2 and a.uop.axis == 0 and b.uop.axis is None: M //= len(a.device)
+    elif a.ndim == 2 and a.uop.axis == 1 and b.uop.axis == 0: K //= len(a.device)
+    elif a.ndim == 2 and a.uop.axis is None and b.uop.axis == 1: N //= len(a.device)
+    elif a.ndim == 3 and a.uop.axis == 0 and b.uop.axis is None: batch //= len(a.device)
+    elif a.ndim == 3 and a.uop.axis is None and b.uop.axis == 1: N //= len(a.device)
+    elif a.ndim == 3 and a.uop.axis == 2 and b.uop.axis == 0: K //= len(a.device)
+    else: return todo(f"sharding mismatch a.ndim={a.ndim} a.uop.axis={a.uop.axis} b.uop.axis={b.uop.axis}")
     dname = a.device[0]
   else: dname = a.device
   arch = getattr(Device[dname].renderer, "arch", "")
   if batch not in {1, 2}: return todo(f"GEMM batch size {batch}")
-  if (key:=(M, N, K)) not in GEMM_ARGS and arch == "gfx950": return todo(f"GEMM shape not supported {key} on {arch}")
+  if (M % TILE_M != 0 or N % TILE_N != 0 or K % TILE_K != 0) and arch == "gfx950":
+    return todo(f"GEMM shape ({M},{N},{K}) not a multiple of ({TILE_M},{TILE_N},{TILE_K})")
   return True
 
 # ** UOp gemm to test Tensor.custom_kernel multi and backward correctness on non cdna4
@@ -65,6 +75,8 @@ def custom_gemm_bw(gradient:UOp, kernel:UOp):
   out, a, b = kernel.src[1:]
   assert all_same([gradient.device, a.device, b.device, out.device])
   a_t, b_t, g_t = Tensor(a, device=a.device), Tensor(b, device=a.device), Tensor(gradient, device=a.device)
+  # TODO: this needs to be cleaned up and done properly, the batch dim of grad and a multi need to align
+  g_t = g_t[:a.shape[0]]
   grad_a = (g_t @ b_t.T).uop
   grad_b = (a_t.permute(2, 0, 1).reshape(a_t.shape[2], -1) @ g_t.reshape(-1, g_t.shape[-1])).uop
   return (None, grad_a, grad_b)
@@ -74,23 +86,37 @@ def custom_gemm_bw(gradient:UOp, kernel:UOp):
 def asm_gemm(a:Tensor, b:Tensor) -> Tensor:
   assert can_use_asm_gemm(a, b), f"{counters['todos'][-1]}"
   counters["used"] += 1
+  unfold_batch = a.ndim == 3 and isinstance(a.device, tuple) and a.uop.axis == 2 and b.uop.axis == 0
+  if unfold_batch:
+    orig_batch = a.shape[0]
+    a = a.reshape(a.shape[0]*a.shape[1], a.shape[2])
   squeeze = a.ndim == 2
   if squeeze: a = a.unsqueeze(0)
 
   batch, M, K = a.shape
   N = b.shape[1]
   is_multi = isinstance(a.device, tuple)
+  if (k_sharded:=is_multi and a.uop.axis == 2): K //= len(a.device)
+  if (m_sharded:=is_multi and a.uop.axis == 1): M //= len(a.device)
+  n_sharded = is_multi and b.uop.axis == 1
 
   if is_multi:
-    out = Tensor(Tensor.empty(batch//len(a.device), M, N, dtype=a.dtype, device=a.device).uop.multi(0), device=a.device)
+    if n_sharded:
+      out = Tensor(Tensor.empty(batch, M, N//len(a.device), dtype=a.dtype, device=a.device).uop.multi(2), device=a.device)
+    elif m_sharded:
+      out = Tensor(Tensor.empty(batch, M, N, dtype=a.dtype, device=a.device).uop.multi(1), device=a.device)
+    else:
+      out = Tensor(Tensor.empty(batch//len(a.device) if a.uop.axis==0 else batch, M, N, dtype=a.dtype, device=a.device).uop.multi(0), device=a.device)
   else:
     out = Tensor.empty(batch, M, N, dtype=a.dtype, device=a.device)
 
-  dname = a.device[0] if is_multi else a.device
-  arch = getattr(Device[dname].renderer, "arch", "")
+  renderer = Device[a.device[0] if is_multi else a.device].renderer
+  dname, arch = renderer.device, getattr(renderer, "arch", "")
   if arch.startswith("gfx950") and getenv("USE_ASM", 1):
-    numWG = GEMM_ARGS[(M, N, K)][0]
-    out = Tensor.custom_kernel(out, a, b, fxn=functools.partial(custom_asm_gemm, dname=dname, wg=numWG, arch=arch), grad_fxn=custom_gemm_bw)[0]
+    out = Tensor.custom_kernel(out, a, b, fxn=functools.partial(custom_asm_gemm, dname=dname), grad_fxn=custom_gemm_bw)[0]
   else:
     out = Tensor.custom_kernel(out, a, b, fxn=custom_uop_gemm, grad_fxn=custom_gemm_bw)[0]
-  return out.squeeze(0) if squeeze else out
+  if k_sharded: out = out.sum(0)
+  out = out.squeeze(0) if squeeze else out
+  if unfold_batch: out = out.reshape(orig_batch, -1, out.shape[-1])
+  return out

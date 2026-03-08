@@ -76,6 +76,9 @@ class Ops(FastEnum):
   # CUSTOM/CUSTOMI are used to output strings into codegen. the I makes the string inline
   CUSTOM = auto(); CUSTOMI = auto()
 
+  # INS is a machine instruction
+  INS = auto()
+
   # ** 6 -- ops that don't exist in programs **
 
   # tensor graph ops
@@ -98,7 +101,7 @@ class Ops(FastEnum):
   REDUCE_AXIS = auto(); REDUCE = auto(); ALLREDUCE = auto()
 
   # expander ops
-  UNROLL = auto(); CONTRACT = auto(); CAT = auto(); PTRCAT = auto()
+  UNROLL = auto(); CONTRACT = auto(); VCAT = auto(); PTRCAT = auto()
 
 class GroupOp:
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL, Ops.NEG, Ops.TRUNC}

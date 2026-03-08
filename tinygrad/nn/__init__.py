@@ -1,8 +1,7 @@
 from __future__ import annotations
-import math
+import math, functools
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.device import is_dtype_supported
 from tinygrad.helpers import prod, make_tuple, flatten, USE_ATOMICS
 from tinygrad.nn import optim, state, datasets  # noqa: F401
 
@@ -36,7 +35,7 @@ class BatchNorm:
     self.weight: Tensor|None = Tensor.ones(sz) if affine else None
     self.bias: Tensor|None = Tensor.zeros(sz) if affine else None
 
-    self.num_batches_tracked = Tensor.zeros(dtype='long' if is_dtype_supported(dtypes.long) else 'int', requires_grad=False)
+    self.num_batches_tracked = Tensor.zeros(dtype='long', requires_grad=False)
     if track_running_stats: self.running_mean, self.running_var = Tensor.zeros(sz, requires_grad=False), Tensor.ones(sz, requires_grad=False)
 
   def calc_stats(self, x:Tensor) -> tuple[Tensor, Tensor]:
@@ -344,6 +343,10 @@ def _embedding_fwd(weight:Tensor, idx:Tensor) -> Tensor:
   arange = Tensor.arange(weight.shape[0], requires_grad=False, device=weight.device)
   return (arange == idx.unsqueeze(-1)).unsqueeze(-1).where(weight, 0).sum(-2, dtype=weight.dtype)
 
+@functools.cache
+def _embedding_fwd_fxn(wp, ip, device):
+  return _embedding_fwd(Tensor(wp, device=device), Tensor(ip, device=device))
+
 class Embedding:
   """
   A simple lookup table that stores embeddings of a fixed dictionary and size.
@@ -360,7 +363,9 @@ class Embedding:
 
   def __call__(self, idx:Tensor) -> Tensor:
     if not dtypes.is_int(idx.dtype): raise TypeError(f"Expected integer dtype for index in embedding, got {idx.dtype}")
-    if USE_ATOMICS: return Tensor.call(self.weight, idx, fxn=_embedding_fwd(self.weight.as_param(0), idx.as_param(1)), grad_fxn=_embedding_bwd)
+    if USE_ATOMICS:
+      fxn = _embedding_fwd_fxn(self.weight.as_param(0).uop, idx.as_param(1).uop, self.weight.device)
+      return Tensor.call(self.weight, idx, fxn=fxn, grad_fxn=_embedding_bwd)
     return _embedding_fwd(self.weight, idx)
 
 class LSTMCell:
@@ -385,5 +390,4 @@ class LSTMCell:
     i, f, g, o = gates.chunk(4, dim=1)
     i, f, g, o = i.sigmoid(), f.sigmoid(), g.tanh(), o.sigmoid()
     new_c = f * hc[1] + i * g
-    new_h = o * new_c.tanh()
-    return (new_h.contiguous(), new_c.contiguous())
+    return o * new_c.tanh(), new_c
