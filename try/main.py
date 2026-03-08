@@ -6,14 +6,14 @@ import tinygrad as tg
 def print_tensor(t):
   print('***********')
   #print("DATA:", t.data()[0])
-  print("LAZYDATA:\n", t.lazydata)
-  print("LAZYDATA:")
-  pprint(t.lazydata.__dict__)
-  print("TYPE LAZYDATA:", type(t.lazydata))
-  if t.lazydata.base:
-    print("BASE:")
-    pprint(t.lazydata._base.__dict__)
-    print("TYPE BASE:", type(t.lazydata._base))
+  print("UOP:\n", t.uop)
+  print("UOP DICT:")
+  pprint(t.uop.__dict__)
+  print("TYPE UOP:", type(t.uop))
+  if t.uop.base is not None:
+    print("BASE DICT:")
+    pprint(t.uop.base.__dict__)
+    print("TYPE BASE:", type(t.uop.base))
   print("SHAPE:", t.shape)
   print("DTYPE:", t.dtype)
   print("DEVICE:", t.device)
