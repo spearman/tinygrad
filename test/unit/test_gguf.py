@@ -1,11 +1,29 @@
 import os, struct, unittest
 from tinygrad import dtypes, Tensor, fetch, Device
-from tinygrad.nn.state import ggml_data_to_tensor, gguf_load
+from tinygrad.nn.state import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
+from gguf.quants import IQ2_S, IQ3_S, IQ3_XXS
 
 ggml_test_block_count = 4
+
+class TestGGUFTables(unittest.TestCase):
+  def test_iq2_s_grid_matches_gguf_py(self):
+    IQ2_S.init_grid()
+    grid = _ggml_iq_grid(Device.DEFAULT, _ggml.iq2s_grid, (1024, 8)).numpy()
+    np.testing.assert_equal(grid, IQ2_S.grid.reshape(1024, 8))
+
+  def test_iq3_xxs_grid_matches_gguf_py(self):
+    IQ3_XXS.init_grid()
+    grid = _ggml_iq_grid(Device.DEFAULT, _ggml.iq3xxs_grid, (256, 4)).numpy()
+    np.testing.assert_equal(grid, IQ3_XXS.grid.reshape(256, 4))
+
+  def test_iq3_s_grid_matches_gguf_py(self):
+    IQ3_S.init_grid()
+    grid = _ggml_iq_grid(Device.DEFAULT, _ggml.iq3s_grid, (512, 4)).numpy()
+    np.testing.assert_equal(grid, IQ3_S.grid.reshape(512, 4))
 
 @unittest.skipIf(any(not is_dtype_supported(t) for t in [ dtypes.uint8, dtypes.half ]), "Backend must support uint8 and half")
 class TestGGUF(unittest.TestCase):
@@ -30,11 +48,19 @@ class TestGGUF(unittest.TestCase):
 
   def test_dequantization_q4_0(self): self._test_dequantization(GGMLQuantizationType.Q4_0)
   def test_dequantization_q4_1(self): self._test_dequantization(GGMLQuantizationType.Q4_1)
+  def test_dequantization_q5_0(self): self._test_dequantization(GGMLQuantizationType.Q5_0)
+  def test_dequantization_q5_1(self): self._test_dequantization(GGMLQuantizationType.Q5_1)
   def test_dequantization_q8_0(self): self._test_dequantization(GGMLQuantizationType.Q8_0)
   def test_dequantization_q4_k(self): self._test_dequantization(GGMLQuantizationType.Q4_K)
   def test_dequantization_q5_k(self): self._test_dequantization(GGMLQuantizationType.Q5_K)
   def test_dequantization_q6_k(self): self._test_dequantization(GGMLQuantizationType.Q6_K)
+  def test_dequantization_iq3_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ3_XXS)
+  def test_dequantization_iq3_s(self): self._test_dequantization(GGMLQuantizationType.IQ3_S)
+  def test_dequantization_iq2_s(self): self._test_dequantization(GGMLQuantizationType.IQ2_S)
+  def test_dequantization_iq4_xs(self): self._test_dequantization(GGMLQuantizationType.IQ4_XS)
   def test_dequantization_mxfp4(self): self._test_dequantization(GGMLQuantizationType.MXFP4)
+  @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
+  def test_dequantization_bf16(self): self._test_dequantization(GGMLQuantizationType.BF16)
   def test_dequantization_mxfp4_old(self):
     def encode(nibbles, E):
       packed = [(low & 0xF) | ((high & 0xF) << 4) for low, high in zip(nibbles[:16], nibbles[16:])]
@@ -76,6 +102,13 @@ class TestGGUF(unittest.TestCase):
                         0.04687500,  0.00000000, 0.00000000,  0.01562500], dtype=np.float32)
     out = ggml_data_to_tensor(Tensor(block), 32, GGMLQuantizationType.MXFP4.value)
     np.testing.assert_equal(out.numpy(), expected)
+
+  def test_dequantization_q1_0(self):
+    # Q1_0: 2 bytes fp16 scale + 16 bytes (128 1-bit values)
+    block = np.frombuffer(np.float16(2.0).tobytes() + np.packbits(np.random.choice([0, 1], size=128)).tobytes(), dtype=np.uint8).copy()
+    expected = np.float16(2.0) * (np.unpackbits(block[2:], bitorder="little").astype(np.int8) * 2 - 1)
+    # TODO: replace 41 with GGMLQuantizationType.Q1_0.value on next gguf-py release
+    np.testing.assert_equal(ggml_data_to_tensor(Tensor(block), 128, 41).numpy().flatten(), expected)
 
   def test_expected_failure_unknown_type(self):
     with self.assertRaises(ValueError):
@@ -120,17 +153,24 @@ class TestGGUF(unittest.TestCase):
 class TestGGUFGEMV(unittest.TestCase):
   def _test_gguf_gemv(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
-    rows, cols = 8192, 2048
+    rows, cols = (1024, 512) if qtype == GGMLQuantizationType.BF16 else (8192, 2048)
     n_blocks = rows * cols // block_size
     rng = np.random.default_rng(42)
-    # generate random quantized blocks with valid fp16 scale fields (random bytes can produce NaN scales)
-    q_data = rng.integers(0, 256, size=n_blocks * type_size, dtype=np.uint8).reshape(n_blocks, type_size)
-    scales = np.float16(rng.standard_normal(n_blocks * 4)).view(np.uint8).reshape(n_blocks, -1)
-    if qtype == GGMLQuantizationType.Q8_0: q_data[:, :2] = scales[:, :2]                    # d at offset 0
-    elif qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K): q_data[:, :4] = scales[:, :4] # d, dmin at offset 0
-    elif qtype == GGMLQuantizationType.Q6_K: q_data[:, -2:] = scales[:, :2]                 # d at end
-    elif qtype == GGMLQuantizationType.MXFP4: q_data[:, 0] = rng.integers(120, 136, size=n_blocks, dtype=np.uint8) # constrain byte0
-    q_data = q_data.flatten()
+    if qtype == GGMLQuantizationType.BF16:
+      q_data = (rng.standard_normal(rows * cols).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16).view(np.uint8)
+    else:
+      # generate random quantized blocks with valid fp16 scale fields (random bytes can produce NaN scales)
+      q_data = rng.integers(0, 256, size=n_blocks * type_size, dtype=np.uint8).reshape(n_blocks, type_size)
+      scales = np.float16(rng.standard_normal(n_blocks * 4)).view(np.uint8).reshape(n_blocks, -1)
+      if qtype in (GGMLQuantizationType.Q5_0, GGMLQuantizationType.Q8_0,
+                   GGMLQuantizationType.IQ3_XXS,
+                   GGMLQuantizationType.IQ2_S,
+                   GGMLQuantizationType.IQ3_S, GGMLQuantizationType.IQ4_XS): q_data[:, :2] = scales[:, :2]  # d at offset 0
+      elif qtype in (GGMLQuantizationType.Q5_1, GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K):
+        q_data[:, :4] = scales[:, :4]  # d, m/dmin at offset 0
+      elif qtype == GGMLQuantizationType.Q6_K: q_data[:, -2:] = scales[:, :2]               # d at end
+      elif qtype == GGMLQuantizationType.MXFP4: q_data[:, 0] = rng.integers(120, 136, size=n_blocks, dtype=np.uint8) # constrain byte0
+      q_data = q_data.flatten()
     ref = dequantize(q_data, qtype).reshape(rows, cols)
 
     # build a minimal gguf in memory: header + 1 tensor info + aligned data
@@ -147,15 +187,24 @@ class TestGGUFGEMV(unittest.TestCase):
     _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None))
 
     x = rng.standard_normal(cols).astype(np.float32)
-    np.testing.assert_allclose((tensors["weight"] @ Tensor(x)).numpy(), ref @ x, atol=1e-2, rtol=1e-2)
-    np.testing.assert_equal(tensors["weight"].numpy(), ref)
+    with np.errstate(all='ignore'):
+      np.testing.assert_allclose((tensors["weight"] @ Tensor(x)).numpy(), ref @ x, atol=1e-2, rtol=1e-2)
+    if qtype == GGMLQuantizationType.BF16 or is_dtype_supported(dtypes.half): np.testing.assert_equal(tensors["weight"].numpy(), ref)
     assert np.isfinite(ref).all() and np.isfinite(tensors["weight"].numpy()).all(), f"{qtype.name} has NaN/Inf"
 
   def test_gguf_gemv_q8_0(self): self._test_gguf_gemv(GGMLQuantizationType.Q8_0)
+  def test_gguf_gemv_q5_0(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_0)
+  def test_gguf_gemv_q5_1(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_1)
   def test_gguf_gemv_q4_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q4_K)
   def test_gguf_gemv_q5_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_K)
   def test_gguf_gemv_q6_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q6_K)
+  def test_gguf_gemv_iq3_xxs(self): self._test_gguf_gemv(GGMLQuantizationType.IQ3_XXS)
+  def test_gguf_gemv_iq3_s(self): self._test_gguf_gemv(GGMLQuantizationType.IQ3_S)
+  def test_gguf_gemv_iq2_s(self): self._test_gguf_gemv(GGMLQuantizationType.IQ2_S)
+  def test_gguf_gemv_iq4_xs(self): self._test_gguf_gemv(GGMLQuantizationType.IQ4_XS)
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
+  @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
+  def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
 
 if __name__ == '__main__':
   unittest.main()

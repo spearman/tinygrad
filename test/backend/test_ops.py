@@ -2,7 +2,7 @@ import time, math, unittest, functools, platform, warnings
 import numpy as np
 from typing import List, Callable
 import torch
-from tinygrad.helpers import getenv, IMAGE, DEBUG, CI, Context, CPU_LLVM, AMD_LLVM, EMULATE
+from tinygrad.helpers import getenv, CI, DEBUG, DEV, IMAGE, Context
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.device import is_dtype_supported
@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", message="Non-empty compiler output encountered
 
 FORWARD_ONLY = getenv("FORWARD_ONLY", 0)
 PRINT_TENSORS = getenv("PRINT_TENSORS", 0)
-COMPILE_ONLY = Device.DEFAULT == "NULL" and not EMULATE
+COMPILE_ONLY = Device.DEFAULT == "NULL"
 
 def slow_test(test_func):
   return unittest.skipIf(getenv("SKIP_SLOW_TEST"), "Skipping slow test")(test_func)
@@ -94,7 +94,7 @@ def prepare_test_op(low, high, shps, vals, forward_only=False):
 class TestOps(unittest.TestCase):
 
   def helper_test_exception(self, shps, torch_fxn, tinygrad_fxn=None, expected=None, forward_only=False, exact=False, vals=None, low=-1.5, high=1.5):
-    if getenv("MOCKGPU") and Device.DEFAULT == "NV": self.skipTest('helper_test_exception fails in CI CUDA')
+    if DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV": self.skipTest('helper_test_exception fails in CI CUDA')
     ts, tst = prepare_test_op(low, high, shps, vals, forward_only)
     if tinygrad_fxn is None:
       tinygrad_fxn = torch_fxn
@@ -281,6 +281,17 @@ class TestOps(unittest.TestCase):
     helper_test_op([], lambda: torch.arange(5.5, 175.5, 2.5), lambda: Tensor.arange(5.5, 175.5, 2.5), forward_only=True)
     helper_test_op([], lambda: torch.arange(-30.2, -0.3, 0.75), lambda: Tensor.arange(-30.2, -0.3, 0.75), forward_only=True)
     helper_test_op([], lambda: torch.arange(-50.3, -380.2, -2.25), lambda: Tensor.arange(-50.3, -380.2, -2.25), forward_only=True)
+    # boundary values that fit exactly in int8 (min=-128, max=127)
+    helper_test_op([], lambda: torch.arange(128, dtype=torch.int8), lambda: Tensor.arange(128, dtype=dtypes.int8), forward_only=True)
+    helper_test_op([], lambda: torch.arange(-128, 128, dtype=torch.int8), lambda: Tensor.arange(-128, 128, dtype=dtypes.int8), forward_only=True)
+    helper_test_op([], lambda: torch.arange(127, -129, -1, dtype=torch.int8),
+                   lambda: Tensor.arange(127, -129, -1, dtype=dtypes.int8), forward_only=True)
+    # overflow: tinygrad raises (torch silently wraps)
+    with self.assertRaises(OverflowError): Tensor.arange(2**33, dtype=dtypes.int)
+    with self.assertRaises(OverflowError): Tensor.arange(129, dtype=dtypes.int8)            # last=128 overflows
+    with self.assertRaises(OverflowError): Tensor.arange(-129, 128, dtype=dtypes.int8)      # start=-129 overflows
+    with self.assertRaises(OverflowError): Tensor.arange(128, 0, -1, dtype=dtypes.int8)     # start=128 overflows
+    with self.assertRaises(OverflowError): Tensor.arange(127, -130, -1, dtype=dtypes.int8)  # last=-129 overflows
 
   def test_arange_big(self):
     helper_test_op([], lambda: torch.arange(256, dtype=torch.int32), lambda: Tensor.arange(256), forward_only=True)
@@ -479,9 +490,9 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
     helper_test_op(None, torch.maximum, Tensor.maximum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], [True, True, False]], forward_only=True)
 
@@ -496,9 +507,9 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], 3.])
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
     helper_test_op(None, torch.minimum, Tensor.minimum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], True], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], [True, True, False]], forward_only=True)
 
@@ -560,7 +571,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65), (45,65)], lambda x,y: x/y)
     helper_test_op([(), ()], lambda x,y: x/y)
 
-  @unittest.skipIf(Device.DEFAULT == "AMD" and AMD_LLVM, "AMD with LLVM backend generate rcp in FP division causes trunc/floor errors")
+  @unittest.skipIf(Device.DEFAULT == "AMD" and DEV.renderer == "LLVM", "AMD with LLVM backend generate rcp in FP division causes trunc/floor errors")
   def test_div_rounding_mode(self):
     for denominator in [-10, -5, -3, -2, -1, 1, 2, 3, 5, 10]:
       # int numerator
@@ -837,38 +848,56 @@ class TestOps(unittest.TestCase):
     helper_test_op([], lambda: tor.__rshift__(2), lambda: ten.__rshift__(2).cast(dtypes.int32), forward_only=True)
     helper_test_op([], lambda: tor.bitwise_right_shift(2), lambda: ten.rshift(2).cast(dtypes.int32), forward_only=True)
 
+  def test_lshift_signed(self):
+    data = [[-1, -3, 1, 7], [0, -2147483648, 2147483647, -1]]
+    tor = torch.tensor(data, dtype=torch.int32)
+    ten = Tensor(data, dtype=dtypes.int)
+    helper_test_op([], lambda: tor << 0, lambda: ten << 0, forward_only=True)
+    helper_test_op([], lambda: tor << 2, lambda: ten << 2, forward_only=True)
+    helper_test_op([], lambda: tor << 8, lambda: ten << 8, forward_only=True)
+    helper_test_op([], lambda: tor << 31, lambda: ten << 31, forward_only=True)
+
+  def test_rshift_signed(self):
+    data = [[-1, -3, 1, 7], [0, -2147483648, 2147483647, -1]]
+    tor = torch.tensor(data, dtype=torch.int32)
+    ten = Tensor(data, dtype=dtypes.int)
+    helper_test_op([], lambda: tor >> 0, lambda: ten >> 0, forward_only=True)
+    helper_test_op([], lambda: tor >> 2, lambda: ten >> 2, forward_only=True)
+    helper_test_op([], lambda: tor >> 8, lambda: ten >> 8, forward_only=True)
+    helper_test_op([], lambda: tor >> 31, lambda: ten >> 31, forward_only=True)
+
   def test_idiv_shift_rewrite_negative(self):
     a = Tensor(-5).idiv(2).item()
     b = Tensor(-5).contiguous().idiv(2).item()
     self.assertEqual(a, b)
     self.assertEqual(Tensor(-1).contiguous().idiv(4).item(), 0)  # NOTE this is trunc-div behaviour
 
-  @unittest.skipIf(getenv("NV_NAK"), "MUFU.SIN is not accurate enough")
+  @unittest.skipIf(DEV.renderer == "NAK", "MUFU.SIN is not accurate enough")
   def test_sin(self):
     helper_test_op([(45,65)], lambda x: x.sin())
     helper_test_op([()], lambda x: x.sin())
     # works on real CUDA but not CI
-    if not ((getenv("MOCKGPU") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
+    if not ((DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
       helper_test_op(None, lambda x: x.sin(), vals=[[math.nan, math.inf, -math.inf, 0.0]])
       helper_test_op(None, lambda x: x.sin(), vals=[[1e1, 1e2, 1e3, 1e4, 1e5, 1e6, -1e1, -1e2, -1e3, -1e4, -1e5, -1e6]],
                     atol=3e-3, rtol=3e-3, grad_atol=3e-3, grad_rtol=3e-3)
   @unittest.skipIf(Device.DEFAULT == "WEBGPU" and platform.system() == "Windows", "Not accurate enough with DirectX backend")
-  @unittest.skipIf(getenv("NV_NAK"), "MUFU.SIN is not accurate enough")
+  @unittest.skipIf(DEV.renderer == "NAK", "MUFU.SIN is not accurate enough")
   def test_cos(self):
     helper_test_op([(45,65)], lambda x: x.cos())
     helper_test_op([()], lambda x: x.cos())
-    if not ((getenv("MOCKGPU") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
+    if not ((DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
       helper_test_op(None, lambda x: x.cos(), vals=[[math.nan, math.inf, -math.inf, 0.0]])
       helper_test_op(None, lambda x: x.cos(), vals=[[1e1, 1e2, 1e3, 1e4, 1e5, 1e6, -1e1, -1e2, -1e3, -1e4, -1e5, -1e6]],
                     atol=3e-3, rtol=3e-3, grad_atol=3e-3, grad_rtol=3e-3)
   @unittest.skipIf(Device.DEFAULT == "WEBGPU" and platform.system() == "Windows", "Not accurate enough with DirectX backend")
-  @unittest.skipIf(getenv("NV_NAK"), "MUFU.SIN is not accurate enough")
+  @unittest.skipIf(DEV.renderer == "NAK", "MUFU.SIN is not accurate enough")
   def test_tan(self):
     # NOTE: backward has much higher diff with input close to pi/2 and -pi/2
     helper_test_op([(45,65)], lambda x: x.tan(), low=-1.5, high=1.5)
     helper_test_op([(45,65)], lambda x: x.tan(), low=-5, high=5)
     helper_test_op([()], lambda x: x.tan())
-    if not ((getenv("MOCKGPU") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
+    if not ((DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
       helper_test_op(None, lambda x: x.tan(), vals=[[math.nan, math.inf, -math.inf, 0.0]])
       helper_test_op(None, lambda x: x.tan(), vals=[[1e1, 1e2, 1e3, 1e4, 1e5, 1e6, -1e1, -1e2, -1e3, -1e4, -1e5, -1e6]],
                     atol=3e-3, rtol=3e-3, grad_atol=3e-3, grad_rtol=3e-3)
@@ -1398,7 +1427,7 @@ class TestOps(unittest.TestCase):
                                                                          np.arange(64,128,dtype=np.float32).reshape(8,8)])
   def test_small_gemm_eye(self):
     helper_test_op(None, lambda x,y: x.matmul(y), lambda x,y: x@y, vals=[np.eye(8).astype(np.float32), np.eye(8).astype(np.float32)])
-  @unittest.skipIf(CI and Device.DEFAULT in ["NV", "CL", "CUDA"] or (Device.DEFAULT == "CPU" and CPU_LLVM) or IMAGE
+  @unittest.skipIf(CI and Device.DEFAULT in ["NV", "CL", "CUDA"] or (Device.DEFAULT == "CPU" and DEV.renderer == "LLVM") or IMAGE
   or (Device.DEFAULT == "WEBGPU" and platform.system() == "Windows"), "not supported on these in CI/IMAGE")
   @unittest.skipIf(Device.DEFAULT == "QCOM", "not precise enough")
   def test_gemm_fp16(self):
@@ -2396,7 +2425,7 @@ class TestOps(unittest.TestCase):
       lambda x,w: torch.nn.functional.conv2d(x,w,stride=2),
       lambda x,w: Tensor.conv2d(x,w,stride=2))
 
-  @unittest.skipUnless(Device.DEFAULT == "CPU" and CPU_LLVM, "DEVECTORIZE=0 only for LLVM")
+  @unittest.skipUnless(Device.DEFAULT == "CPU" and DEV.renderer == "LLVM", "DEVECTORIZE=0 only for LLVM")
   def test_strided_conv2d_simple_vec(self):
     with Context(DEVECTORIZE=0): self.test_strided_conv2d_simple()
 
@@ -2715,9 +2744,9 @@ class TestOps(unittest.TestCase):
       lambda x: Tensor.avg_pool2d(x, kernel_size=(11,28)), rtol=1e-5)
 
   def test_avg_pool3d(self):
-    # TODO: AMD_LLVM has larger atol
-    # TODO: PYTHON=1 backward hangs?
-    atol = 1e-2 if AMD_LLVM else 1e-6
+    # TODO: AMD:LLVM has larger atol
+    # TODO: DEV=PYTHON backward hangs?
+    atol = 1e-2 if DEV.device == "AMD" and DEV.renderer == "LLVM" else 1e-6
     helper_test_op([(1,1,16,16,16)],
       lambda x: torch.nn.functional.avg_pool3d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False),
       lambda x: Tensor.avg_pool2d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False), atol=atol, rtol=1e-5, forward_only=True)
@@ -3281,7 +3310,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(32,10)], lambda x: x.masked_fill((x>0.1).detach(), -math.inf))
     helper_test_op([(32,10)], lambda x: x.masked_fill((x<0.1).detach(), -math.inf))
 
-  @unittest.skipIf((getenv("MOCKGPU") or Device.DEFAULT == "PYTHON"), "very slow on MOCKGPU because reduce does not fold")
+  @unittest.skipIf((DEV.interface.startswith("MOCK") or Device.DEFAULT == "PYTHON"), "very slow on MOCKGPU because reduce does not fold")
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "webgpu runtime issue")
   @unittest.skipIf(Device.DEFAULT == "QCOM", "QCOM fails with: Resource deadlock avoided")
   def test_masked_select(self):

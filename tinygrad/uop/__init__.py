@@ -26,7 +26,8 @@ class Ops(FastEnum):
 
   # uops that aren't rendered
   NOOP = auto(); REWRITE_ERROR = auto()
-  PARAM = auto(); CALL = auto()
+  # FUNCTION has a TUPLE body and is gradient-able; CALL is an opaque kernel invocation
+  PARAM = auto(); FUNCTION = auto(); CALL = auto()
 
   # renderer
   # LINEAR is a list of UOps, SOURCE has a str arg that's human readable, BINARY has bytes arg that's compiled
@@ -34,10 +35,13 @@ class Ops(FastEnum):
 
   # AFTER passes src[0] through and promises in the toposort that any consumers of the AFTER run after src[1:]
   # GROUP is a NOOP that just merges things together
-  SINK = auto(); AFTER = auto(); GROUP = auto()
+  SINK = auto(); AFTER = auto(); GROUP = auto(); BEAM = auto()
 
   # vector creation / item selection
   GEP = auto(); VECTORIZE = auto()
+
+  # tuple/gettuple for function with multiple returns
+  TUPLE = auto(); GETTUPLE = auto()
 
   # ** 3 -- load/store **
 
@@ -50,7 +54,7 @@ class Ops(FastEnum):
   # ** 4 -- math **
 
   # tensor core math op, not elementwise
-  WMMA = auto()
+  WMMA = auto(); SHAPED_WMMA = auto()
 
   # UnaryOps
   CAST = auto(); BITCAST = auto(); EXP2 = auto(); LOG2 = auto(); SIN = auto()
@@ -82,7 +86,7 @@ class Ops(FastEnum):
   # ** 6 -- ops that don't exist in programs **
 
   # tensor graph ops
-  UNIQUE = auto(); DEVICE = auto(); ASSIGN = auto()
+  UNIQUE = auto(); DEVICE = auto()
 
   # local unique
   LUNIQUE = auto()
@@ -91,7 +95,7 @@ class Ops(FastEnum):
   CONTIGUOUS = auto(); CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
 
   # buffer ops
-  BUFFERIZE = auto(); COPY = auto(); BUFFER = auto(); BUFFER_VIEW = auto(); MSELECT = auto(); MSTACK = auto(); ENCDEC = auto()
+  BUFFERIZE = auto(); COPY = auto(); BUFFER = auto(); BUFFER_VIEW = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
 
   # the core 6 movement ops! these only exist in the tensor graph
   RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); FLIP = auto()

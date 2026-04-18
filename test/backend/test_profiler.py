@@ -1,11 +1,11 @@
 import unittest, struct, contextlib, statistics, gc
 from tinygrad import Device, Tensor, dtypes, TinyJit
-from tinygrad.helpers import CI, getenv, Context, ProfileRangeEvent, cpu_profile, cpu_events, ProfilePointEvent, dedup
+from tinygrad.helpers import CI, DEV, Context, ProfileRangeEvent, cpu_profile, cpu_events, ProfilePointEvent, dedup
 from tinygrad.device import Buffer, BufferSpec, Compiled, ProfileDeviceEvent, ProfileGraphEvent
 from tinygrad.runtime.support.hcq import HCQCompiled
 from tinygrad.engine.realize import get_runner
 
-MOCKGPU = getenv("MOCKGPU")
+MOCKGPU = DEV.interface.startswith("MOCK")
 def _dev_base(d):
   p = d.split(":")
   return p[0] if len(p) < 2 or not p[1].isdigit() else f"{p[0]}:{p[1]}"
@@ -134,7 +134,7 @@ class TestProfiler(unittest.TestCase):
     _, _ = helper_profile_filter_device(profile, TestProfiler.d0.device)
     _, _ = helper_profile_filter_device(profile, d1.device)
 
-    assert len(graph_evs) == 1, "one graph event is expected"
+    assert len(graph_evs) == 2, "2 graph events are expected"
     assert len(graph_evs[0].ents) == 2, "two entities are expected"
 
   @unittest.skipIf(CI or not issubclass(type(Device[Device.DEFAULT]), HCQCompiled), "skip CI")

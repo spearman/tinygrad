@@ -107,10 +107,6 @@ class TestIdxUpcast(unittest.TestCase):
     uops = self._schedule_render(a)
     assert all(uop.dtype is not dtypes.long for uop in uops)
 
-  def test_arange_raise_overflow(self):
-    with self.assertRaises(ValueError):
-      self._schedule_render(Tensor.arange(2**33, dtype=dtypes.int))
-
   @unittest.skipIf(is_dtype_supported(dtypes.long), "int64 is supported")
   def test_int64_unsupported_overflow_sym(self):
     with self.assertRaises((KeyError, RuntimeError)):
@@ -161,6 +157,37 @@ class TestTensorUnique(unittest.TestCase):
     c = a * 2
     Tensor.realize(b,c)
     self.assertIs(b.uop.buffer, c.uop.buffer)
+
+class TestRand(unittest.TestCase):
+  def test_rand_large_tensor(self):
+    # large tensor rand (num > uint32.max) should not crash in frontend
+    Tensor.manual_seed(0)
+    Tensor.rand(2**17, 2**17).schedule()
+    Tensor.rand(2**17, 2**17).schedule()
+    Tensor.rand(2**17, 2**17).schedule()
+
+class TestTensorConstLike(unittest.TestCase):
+  def test_const_like_shape(self):
+    t = Tensor.ones(3, 4)
+    c = t.const_like(0)
+    self.assertEqual(c.shape, (3, 4))
+    self.assertEqual(c.dtype, t.dtype)
+
+  def test_const_like_multi_device(self):
+    devs = ("NULL:0", "NULL:1")
+    t = Tensor.ones(8, 4).shard(devs, axis=0)
+    c = t.const_like(5)
+    self.assertEqual(c.shape, (8, 4))
+    self.assertEqual(c.device, t.device)
+    self.assertEqual(c.uop.axis, 0)
+
+  def test_full_like_device_on_multi_raises(self):
+    t = Tensor.ones(8, 4).shard(("NULL:0", "NULL:1"), axis=0)
+    with self.assertRaises(RuntimeError): t.full_like(5, device="NULL")
+
+class TestTensorDevice(unittest.TestCase):
+  def test_create_from_single_device_tuple(self):
+    (Tensor([1.0], device=(Device.DEFAULT,)) + Tensor([2.0])).realize()
 
 if __name__ == '__main__':
   unittest.main()

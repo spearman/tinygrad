@@ -6,7 +6,8 @@ from tinygrad import Tensor, Context, Device, dtypes
 from tinygrad.uop.ops import Ops
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.engine.realize import CompiledRunner, get_program
-from tinygrad.engine.schedule import ExecItem
+from tinygrad.schedule import ExecItem
+from test.helpers import replace_opts
 
 N = 512
 
@@ -39,7 +40,7 @@ def create_gemm_model(model_path:str, batch_size=N, in_size=N, out_size=N, bias=
 
 def sexec(out:Tensor, opts:list[Opt], replace_src=None, run_count=3):
   si = out.schedule()[-1]
-  prg = get_program(si.ast, renderer=Device[Device.DEFAULT].renderer, opts=opts)
+  prg = get_program(replace_opts(si.ast, opts), renderer=Device[Device.DEFAULT].renderer)
   if replace_src is not None:
     old_name = prg.src.split("__attribute__((noinline)) void ")[1].split("(")[0]
     prg = replace(prg, src=replace_src + "/* DSP boilerplate */" + prg.src.split("/* DSP boilerplate */")[1].replace(old_name, "fxn"))
@@ -204,13 +205,13 @@ class TestQuantizeOnnx(unittest.TestCase):
     W = Tensor(m2:=(np.random.uniform(0, 255, size=(N,N)).astype(wi))).realize()
     tg_dtype = dtypes.int8 if xi == np.int8 else dtypes.uint8
     out = (X.int().matmul(W.int())//1000)
-    if clip: out = out.clip(dtypes.min(tg_dtype),dtypes.max(tg_dtype))
+    if clip: out = out.clip(tg_dtype.min, tg_dtype.max)
     out = out.cast(tg_dtype)
     opts = [Opt(op=OptOps.UPCAST, axis=1, arg=128), Opt(op=OptOps.UNROLL, axis=0, arg=4)] if opts is None else opts
     sexec(out, opts, replace_src, run_count=1)
     tout = out.numpy()
     mout = ((m1.astype(np.int32) @ m2.astype(np.int32)) // 1000)
-    if clip: mout = mout.clip(dtypes.min(tg_dtype),dtypes.max(tg_dtype))
+    if clip: mout = mout.clip(tg_dtype.min, tg_dtype.max)
     mout = mout.astype(xi)
     print(tout)
     print(mout)

@@ -3,7 +3,7 @@ import unittest, math, time
 from tinygrad import Tensor, Device, dtypes, Context
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.engine.realize import get_runner
-from tinygrad.engine.schedule import ExecItem
+from tinygrad.schedule import ExecItem
 from tinygrad.engine.jit import TinyJit
 import numpy as np
 
@@ -17,7 +17,7 @@ def assert_allclose(cmp:Tensor, ref:Tensor, **kwargs) -> None:
 
 class TestTK(unittest.TestCase):
   def setUp(self):
-    arch = getattr(Device[Device.DEFAULT].renderer, "arch", "")
+    arch = Device[Device.DEFAULT].renderer.target.arch
     if not arch.startswith("gfx9"):
       self.skipTest(f"arch {arch} not supported")
 

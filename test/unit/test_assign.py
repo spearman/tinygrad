@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import dtypes, Tensor, TinyJit, GlobalCounters, Variable
 from tinygrad.uop.ops import Ops
 from tinygrad.device import is_dtype_supported
-from tinygrad.helpers import temp, CI, CPU_LVP, Context
+from tinygrad.helpers import temp, CI, DEV, Context
 
 N = 200  # has to be bigger than the cache to fail
 
@@ -130,16 +130,13 @@ class TestAssign(unittest.TestCase):
     new = a + old_a
     np.testing.assert_allclose(new.numpy(), 4)
 
-  @unittest.skip("TODO: this is broken")
   def test_assign_changes_alt(self, realize=False):
     a = Tensor(1).contiguous()
     if realize: a.realize()
-    b = a.contiguous()    # b returns a new Tensor
+    b = a.clone()
     b.assign(2)
     b.realize()
     self.assertNotEqual(a.item(), b.item())
-  # on a realized Tensor contiguous child changes the source
-  @unittest.expectedFailure
   def test_assign_changes_realized_alt(self): return self.test_assign_changes_alt(realize=True)
 
   @unittest.skip("assign to contiguous shouldn't change the base buffer")
@@ -193,7 +190,7 @@ class TestAssign(unittest.TestCase):
     new = a + times_a
     np.testing.assert_allclose(new.numpy(), 8)
 
-  @unittest.skipIf(CI and CPU_LVP, "flaky in CI")
+  @unittest.skipIf(CI and DEV.renderer == "LVP", "flaky in CI")
   def test_double_assign(self):
     a = Tensor.ones(4).contiguous().realize()
     a += 1
@@ -272,13 +269,18 @@ class TestAssign(unittest.TestCase):
 
   def test_assign_after(self):
     t = Tensor.zeros(10).contiguous().realize()
-    t.uop = t.uop.after(t.uop.assign((t+1).uop))
+    t.uop = t.uop.after(t.uop.store((t+1).uop))
     np.testing.assert_allclose(t.numpy(), [1.,1.,1.,1.,1.,1.,1.,1.,1.,1.])
 
   def test_assign_after_partial(self):
     t = Tensor.zeros(10).contiguous().realize()
-    t.uop = t.uop.after(t[:5].uop.assign(Tensor.ones(5).uop))
+    t.uop = t.uop.after(t[:5].uop.after(t[:5].uop.store(Tensor.ones(5).uop)))
     np.testing.assert_allclose(t.numpy(), [1.,1.,1.,1.,1.,0.,0.,0.,0.,0.])
+
+  def test_assign_after_target_chain(self):
+    t = Tensor.arange(16).reshape(4, 4).permute(1, 0).contiguous()
+    t.assign(t + 100)
+    np.testing.assert_equal(t.numpy(), [[100, 104, 108, 112], [101, 105, 109, 113], [102, 106, 110, 114], [103, 107, 111, 115]])
 
   def test_assign_contiguous(self):
     b = Tensor.arange(16).reshape(4,4).contiguous().realize()
@@ -616,6 +618,35 @@ class TestAssign(unittest.TestCase):
     # N matmuls + N assigns + 1 final read = 2*N+1 (AFTER embedding allows full graph scheduling with shared contiguous reuse)
     self.assertEqual(GlobalCounters.kernel_count, 2*N+1)
 
+  def test_double_assign_from_const(self):
+    a = Tensor.empty(2)
+    a.assign(Tensor.ones(2))
+    a.assign(Tensor.ones(2))
+    GlobalCounters.reset()
+    a.realize()
+    self.assertEqual(GlobalCounters.kernel_count, 1)
+    self.assertEqual(a.tolist(), [1.,1.])
+
+  def test_nested_after_contiguous_store(self):
+    # Mirrors the nested contiguous-write-then-assign-back shape from torch backend view updates.
+    base = Tensor.empty(3, dtype=dtypes.int64)
+    base.assign(Tensor([1, 2, 3], dtype=dtypes.int64))
+    contig = base.contiguous()
+    contig.assign(Tensor([1, 4, 3], dtype=dtypes.int64))
+    GlobalCounters.reset()
+    base.assign(contig).realize()
+    self.assertEqual(GlobalCounters.kernel_count, 2)  # TODO: first copy is dead, could be 1
+    self.assertEqual(base.tolist(), [1,4,3])
+
+  def test_nested_after_contiguous_store_no_init(self):
+    # Same shape as test_nested_after_contiguous_store, but without the initial assign.
+    base = Tensor.empty(3, dtype=dtypes.int64)
+    contig = base.contiguous()
+    contig.assign(Tensor([1, 4, 3], dtype=dtypes.int64))
+    GlobalCounters.reset()
+    base.assign(contig).realize()
+    self.assertEqual(GlobalCounters.kernel_count, 1)
+    self.assertEqual(base.tolist(), [1,4,3])
 
 class TestAssignOrdering(unittest.TestCase):
   """Tests for complex assign orderings that could differ between lazy and eager execution.
@@ -910,6 +941,68 @@ class TestAssignToUnrealizedView(unittest.TestCase):
     except AssertionError:
       # TODO: broken now, silently dropped
       self.assertEqual(c.tolist(), [[5,5],[5,5]])
+
+class TestPartialAssignToSharedBuffer(unittest.TestCase):
+  def test_five_slices(self):
+    big = Tensor.zeros(50).contiguous().realize()
+    views = [big[i*10:(i+1)*10].reshape(2, 5) for i in range(5)]
+    for v in views: v.assign(v + 1)
+    Tensor.realize(*views)
+    for v in views:
+      np.testing.assert_allclose(v.numpy(), np.ones((2, 5)))
+
+  def test_many_slices(self):
+    n_params = 10
+    big = Tensor.zeros(n_params * 12).contiguous().realize()
+    grads = [big[i*12:(i+1)*12].reshape(3, 4) for i in range(n_params)]
+    for g in grads: g.assign(g + 1)
+    Tensor.realize(*grads)
+    for g in grads:
+      np.testing.assert_allclose(g.numpy(), np.ones((3, 4)))
+
+  def test_mixed_shapes(self):
+    big = Tensor.zeros(100).contiguous().realize()
+    shapes = [(3, 4), (4, 6), (6, 4), (2, 5), (4, 3)]
+    pos, views = 0, []
+    for s in shapes:
+      n = s[0] * s[1]
+      views.append(big[pos:pos+n].reshape(*s))
+      pos += n
+    for v in views: v.assign(v + 1)
+    Tensor.realize(*views)
+    for v, s in zip(views, shapes):
+      np.testing.assert_allclose(v.numpy(), np.ones(s))
+
+
+class TestAfterCachePatterns(unittest.TestCase):
+  def test_double_store_after(self):
+    a = Tensor.zeros(10).contiguous()
+    b = Tensor.zeros(10).contiguous()
+    c = Tensor.ones(10).contiguous()
+    Tensor.realize(a, b, c)
+
+    a_store = a.uop.store(c.uop)
+    b_store = b.uop.store(c.uop)
+
+    a = Tensor(a.uop.after(a_store, b_store))
+    a.realize()
+    np.testing.assert_array_equal(a.numpy(), 1)
+    np.testing.assert_array_equal(b.numpy(), 1)
+
+  def test_double_store_after_different_sizes(self):
+    full = Tensor.zeros(2).contiguous()
+    head = Tensor.zeros(1).contiguous()
+    full_src = Tensor([1, 2], dtype=dtypes.float).contiguous()
+    head_src = Tensor([3], dtype=dtypes.float).contiguous()
+    Tensor.realize(full, head, full_src, head_src)
+
+    full_store = full.uop.store(full_src.uop)
+    head_store = head.uop.store(head_src.uop)
+
+    head = Tensor(head.uop.after(head_store, full_store))
+    head.realize()
+    np.testing.assert_array_equal(head.numpy(), [3])
+    np.testing.assert_array_equal(full.numpy(), [1, 2])
 
 if __name__ == "__main__":
   unittest.main()
