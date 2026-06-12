@@ -4,17 +4,18 @@ mkShell {
     clang
     cmake
     cudatoolkit
-    pipenv
+    loccount
     pkg-config
     pre-commit
     (python3.withPackages (p: with p; [
       ipython
+      numpy
       pip
       pydot
       python-lsp-server
     ]))
     ruff
-    loccount
+    uv
   ];
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     (lib.getLib pkgs.stdenv.cc.cc)  # required for numpy
@@ -24,9 +25,7 @@ mkShell {
   OPENCL_PATH = "${ocl-icd}/lib/libOpenCL.so";
   NVRTC_PATH = "${cudatoolkit}/lib/libnvrtc.so";
   shellHook = ''
-    mkdir -p tmp
-    export TMPDIR="$(pwd)/tmp"
     export CC="clang"
-    pipenv shell
+    uv venv --allow-existing && source .venv/bin/activate
   '';
 }
