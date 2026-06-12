@@ -3,7 +3,7 @@ mkShell {
   buildInputs = [
     clang
     cmake
-    cudaPackages.cudatoolkit
+    cudatoolkit
     pipenv
     pkg-config
     pre-commit
@@ -22,6 +22,7 @@ mkShell {
   ];
   CUDA_PATH = "${linuxPackages.nvidia_x11}/lib/libcuda.so";
   OPENCL_PATH = "${ocl-icd}/lib/libOpenCL.so";
+  NVRTC_PATH = "${cudatoolkit}/lib/libnvrtc.so";
   shellHook = ''
     mkdir -p tmp
     export TMPDIR="$(pwd)/tmp"
