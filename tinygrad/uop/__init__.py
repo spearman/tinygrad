@@ -22,6 +22,9 @@ class Ops(FastEnum):
   # define LOCAL/REG allocate things
   DEFINE_LOCAL = auto(); DEFINE_REG = auto()
 
+  # BUFFER is the new LOCAL/REG
+  BUFFER = auto()
+
   # ** 2 -- non op uops **
 
   # uops that aren't rendered
@@ -35,18 +38,21 @@ class Ops(FastEnum):
 
   # AFTER passes src[0] through and promises in the toposort that any consumers of the AFTER run after src[1:]
   # GROUP is a NOOP that just merges things together
-  SINK = auto(); AFTER = auto(); GROUP = auto(); BEAM = auto()
+  SINK = auto(); AFTER = auto(); GROUP = auto()
 
   # vector creation / item selection
-  GEP = auto(); VECTORIZE = auto()
+  GEP = auto(); STACK = auto()
 
   # tuple/gettuple for function with multiple returns
   TUPLE = auto(); GETTUPLE = auto()
 
+  # hcq specific
+  GETADDR = auto()
+
   # ** 3 -- load/store **
 
   # INDEX is a BinaryOp similar to ADD, but it operates on pointers
-  INDEX = auto()
+  INDEX = auto(); SHRINK = auto()
 
   # load/store before math
   LOAD = auto(); STORE = auto()
@@ -61,10 +67,11 @@ class Ops(FastEnum):
   SQRT = auto(); RECIPROCAL = auto(); NEG = auto(); TRUNC = auto()
 
   # BinaryOps
-  ADD = auto(); MUL = auto(); SHL = auto(); SHR = auto(); IDIV = auto(); MAX = auto(); MOD = auto()
+  ADD = auto(); MUL = auto(); SHL = auto(); SHR = auto(); CDIV = auto(); MAX = auto(); CMOD = auto()
   CMPLT = auto(); CMPNE = auto(); CMPEQ = auto()
   XOR = auto(); OR = auto(); AND = auto()
   THREEFRY = auto(); SUB = auto(); FDIV = auto(); POW = auto()
+  FLOORDIV = auto(); FLOORMOD = auto()
 
   # TernaryOps
   WHERE = auto(); MULACC = auto()
@@ -72,10 +79,10 @@ class Ops(FastEnum):
   # ** 5 -- control flow / consts / custom **
 
   # control flow ops
-  BARRIER = auto(); RANGE = auto(); IF = auto(); END = auto(); ENDIF = auto()
+  BARRIER = auto(); RANGE = auto(); IF = auto(); END = auto(); ENDIF = auto(); WAIT = auto()
 
-  # consts. VCONST is a vectorized const
-  VCONST = auto(); CONST = auto()
+  # const.
+  CONST = auto()
 
   # CUSTOM/CUSTOMI are used to output strings into codegen. the I makes the string inline
   CUSTOM = auto(); CUSTOMI = auto()
@@ -95,24 +102,25 @@ class Ops(FastEnum):
   CONTIGUOUS = auto(); CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
 
   # buffer ops
-  BUFFERIZE = auto(); COPY = auto(); BUFFER = auto(); BUFFER_VIEW = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
+  STAGE = auto(); COPY = auto(); SLICE = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
 
   # the core 6 movement ops! these only exist in the tensor graph
-  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); FLIP = auto()
+  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); FLIP = auto()
   MULTI = auto()  # MULTI is really a movement op
 
   # reduce
-  REDUCE_AXIS = auto(); REDUCE = auto(); ALLREDUCE = auto()
+  REDUCE = auto(); ALLREDUCE = auto()
 
   # expander ops
   UNROLL = auto(); CONTRACT = auto(); VCAT = auto(); PTRCAT = auto()
 
 class GroupOp:
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL, Ops.NEG, Ops.TRUNC}
-  Binary = {Ops.ADD, Ops.MUL, Ops.IDIV, Ops.MAX, Ops.MOD, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
-            Ops.XOR, Ops.SHL, Ops.SHR, Ops.OR, Ops.AND, Ops.THREEFRY, Ops.SUB, Ops.FDIV, Ops.POW}
+  Binary = {Ops.ADD, Ops.MUL, Ops.CDIV, Ops.MAX, Ops.CMOD, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
+            Ops.XOR, Ops.SHL, Ops.SHR, Ops.OR, Ops.AND, Ops.THREEFRY, Ops.SUB, Ops.FDIV, Ops.POW, Ops.FLOORDIV, Ops.FLOORMOD}
   Ternary = {Ops.WHERE, Ops.MULACC}
   ALU = set.union(Unary, Binary, Ternary)
+  Broadcastable = set.union(Binary, Ternary, {Ops.GROUP})
 
   # TODO: is BITCAST always Elementwise if it's shape changing?
   Elementwise = set.union(ALU, {Ops.CAST, Ops.BITCAST})
@@ -121,8 +129,6 @@ class GroupOp:
 
   Irreducible = {Ops.CONST, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.RANGE}
   Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK, Ops.FLIP}
-
-  Buffer = {Ops.LOAD, Ops.STORE, Ops.CONST, Ops.DEFINE_VAR}
 
   # BinaryOps that can be flipped
   Commutative = {Ops.ADD, Ops.MUL, Ops.MAX, Ops.CMPNE, Ops.CMPEQ, Ops.XOR, Ops.AND, Ops.OR}
@@ -135,8 +141,5 @@ class GroupOp:
 
   # These can change the dtype to bool
   Comparison = {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}
-
-  # do not preserve f(0) = 0
-  UnsafePad = {Ops.RECIPROCAL, Ops.LOG2, Ops.EXP2, Ops.IDIV, Ops.POW}
 
   All = set(Ops)

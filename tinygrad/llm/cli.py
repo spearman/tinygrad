@@ -1,7 +1,8 @@
 from __future__ import annotations
 import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
-from tinygrad import Tensor, nn
-from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context
+from tinygrad import nn
+from tinygrad.uop.ops import UOp, Ops
+from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
 
@@ -190,16 +191,12 @@ def main():
   args = parser.parse_args()
 
   # load the model
-  raw_model = Tensor.from_url(models.get(args.model, args.model))
-  model, kv = Transformer.from_gguf(raw_model, args.max_context)
+  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  print(f"using model \"{model_name}\" with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
-  del raw_model
+  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
+  print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
 
-  # TODO: why this is required to free the RAM of the GGUF copy?
-  import gc
-  gc.collect()
-
+  # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
   # warmup the JIT
@@ -214,7 +211,8 @@ def main():
   # do benchmark
   if args.benchmark is not None:
     gen = model.generate(toks:=[tok.bos_id or 0])
-    for _ in range(args.benchmark):
+    for i in range(args.benchmark):
+      profile_marker(f"decode @ {i}")
       GlobalCounters.reset()
       with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s,"
                   f" {GlobalCounters.global_mem//1000000}/{GlobalCounters.mem_used//1000000} MB  --  "+\
