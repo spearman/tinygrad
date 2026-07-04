@@ -1,23 +1,26 @@
 import math, functools, operator
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 from tinygrad.uop import Ops
 from tinygrad.dtype import dtypes, ConstType, PyConst, least_upper_dtype, least_upper_float
 from tinygrad.helpers import argfix, polyN
-from tinygrad.mixin.dtype import DTypeMixin
 from tinygrad.mixin.creation import CreationMixin
 
+if TYPE_CHECKING:
+  from tinygrad.uop.ops import UOp
 
-class ElementwiseMixin(DTypeMixin, CreationMixin):
+
+class ElementwiseMixin(CreationMixin):
   # required to implement
   def alu(self, op: Ops, *src: Self) -> Self:
     raise NotImplementedError
 
-  def _broadcasted(self, y: Self | ConstType, reverse: bool = False) -> tuple[Self, Self]:
-    raise NotImplementedError
-
   # great functions you get!
-  def ufix(self, x: Self | ConstType) -> Self:
-    return self.const_like(x) if not isinstance(x, ElementwiseMixin) else x
+  def ufix(self, x: 'Self|ConstType|UOp') -> Self:
+    return x if isinstance(x, type(self)) else self._wrap_uop(self._uop.ufix(x))
+
+  # implemented in OpMixin, broadcasting needs the movement ops
+  def _broadcasted(self, y: 'Self|ConstType|UOp', reverse: bool = False) -> tuple[Self, Self]:
+    raise NotImplementedError
 
   def _binop(self, op: Ops, x: Self | ConstType, reverse: bool) -> Self:
     lhs, rhs = self._broadcasted(x, reverse)
@@ -42,7 +45,11 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     """
     return self.cast(dtypes.bool).ne(True)
 
-  def contiguous(self, *args, **kwargs) -> Self: raise NotImplementedError
+  def contiguous(self, **kwargs) -> Self:
+    """
+    Returns a contiguous tensor.
+    """
+    return self._wrap_uop(self._uop.contiguous(**kwargs))
 
   def contiguous_backward(self) -> Self:
     """
@@ -539,7 +546,7 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     """
     base, exponent = self._broadcasted(x, reverse=reverse)
     # TODO: int pow
-    if not base.is_floating_point() and not isinstance(x, ElementwiseMixin) and not (isinstance(x, int) and x >= 0):
+    if not base.is_floating_point() and isinstance(x, ConstType) and not (isinstance(x, int) and x >= 0):
       raise RuntimeError("base needs to be float")
     ret = base.alu(Ops.POW, exponent)
     # NOTE: pow(int, float) -> int
@@ -624,6 +631,7 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     print(Tensor([float('nan')]).isclose(Tensor([float('nan')]), equal_nan=True).numpy())
     ```
     """
+    other = self.ufix(other)
     is_finite_close = self.isfinite() & other.isfinite() & ((self - other).abs() <= atol + rtol * other.abs())
     is_infinite_close = (self.isinf() | other.isinf()) & self.eq(other)
     is_nan_close = (self.isnan() & other.isnan()) & equal_nan
@@ -1064,7 +1072,7 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     print(Tensor([1., 2., 3.]).lerp(Tensor([4., 5., 6.]), 0.5).numpy())
     ```
     """
-    if self.dtype == dtypes.uint8 and isinstance(weight, ElementwiseMixin):
+    if self.dtype == dtypes.uint8 and not isinstance(weight, ConstType):
       w_i = (weight * (1<<(W_PREC:=7)) + 0.5).cast(dtypes.int16)
       return (self+(((end - self).cast(dtypes.int8) * w_i + (1<<W_PREC-1)).cast(dtypes.uint16) >> W_PREC)).cast(dtypes.uint8)
     return self + (end - self) * weight

@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, Device, dtypes, Context
 from tinygrad.helpers import getenv, system, DEV
-from extra.gemm.cdna_asm_gemm import asm_gemm
+from extra.gemm.cdna_asm_gemm import asm_gemm, hk_bf16_atb_gemm
 from test.helpers import needs_second_gpu
 from examples.mlperf.models.flat_llama import FP8_DTYPE, quantize_fp8, FP8_MAX
 
@@ -9,7 +9,7 @@ from examples.mlperf.models.flat_llama import FP8_DTYPE, quantize_fp8, FP8_MAX
 # Use DEV=NULL:HIP:gfx950 to also test the assembly
 def is_cdna4(): return Device[Device.DEFAULT].renderer.target.arch.startswith("gfx950")
 
-def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=None, gpus:int=1) -> None:
+def run_asm_gemm(a_shape, b_shape, dtype=dtypes.bfloat16, a_shard=None, b_shard=None, gpus:int=1) -> None:
   Tensor.manual_seed(0)
   input_dtype = dtypes.bfloat16 if dtype == FP8_DTYPE else dtype
   a_rand = Tensor.randn(a_shape, dtype=dtypes.float).sub(0.5).cast(input_dtype)
@@ -64,31 +64,31 @@ def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=N
     assert a.grad.allclose(a_ref.grad, atol=grad_atol, rtol=grad_rtol).item(), "grad_a mismatch"
     assert b.grad.allclose(b_ref.grad, atol=grad_atol, rtol=grad_rtol).item(), "grad_b mismatch"
 
-def verify_asm_gemm(batch:int, M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=1) -> None:
+def verify_asm_gemm(batch:int, M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=1) -> None:
   run_asm_gemm((batch, M, K), (K, N), dtype=dtype, a_shard=0, b_shard=None, gpus=gpus)
 
-def verify_asm_gemm_k_sharded(M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=8) -> None:
+def verify_asm_gemm_k_sharded(M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=8) -> None:
   run_asm_gemm((M, K), (K, N), dtype=dtype, a_shard=1, b_shard=0, gpus=gpus)
 
-def verify_asm_gemm_n_sharded(batch:int, M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=2) -> None:
+def verify_asm_gemm_n_sharded(batch:int, M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=2) -> None:
   run_asm_gemm((batch, M, K), (K, N), dtype=dtype, a_shard=None, b_shard=1, gpus=gpus)
 
-def verify_asm_gemm_m_sharded(M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=2) -> None:
+def verify_asm_gemm_m_sharded(M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=2) -> None:
   run_asm_gemm((M, K), (K, N), dtype=dtype, a_shard=0, b_shard=None, gpus=gpus)
 
-def verify_asm_gemm_n_sharded_2d(M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=2) -> None:
+def verify_asm_gemm_n_sharded_2d(M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=2) -> None:
   run_asm_gemm((M, K), (K, N), dtype=dtype, a_shard=None, b_shard=1, gpus=gpus)
 
-def verify_asm_gemm_k_sharded_3d(batch:int, M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=2) -> None:
+def verify_asm_gemm_k_sharded_3d(batch:int, M:int, N:int, K:int, dtype=dtypes.bfloat16, gpus:int=2) -> None:
   run_asm_gemm((batch, M, K), (K, N), dtype=dtype, a_shard=2, b_shard=0, gpus=gpus)
 
 # 128x smaller than usual
 # uses the UOp GEMM, runs on non CDNA4 and CI
-@unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "need half")
+@unittest.skipUnless(dtypes.bfloat16 in Device[Device.DEFAULT].renderer.supported_dtypes(), "need half")
 class TestGemm(unittest.TestCase):
   def setUp(self):
     if is_cdna4(): self.skipTest("shapes are too small for the assembly GEMM")
-  def test_simple(self): verify_asm_gemm(1, N:=getenv("N", 32), N, N, dtype=dtypes.half)
+  def test_simple(self): verify_asm_gemm(1, N:=getenv("N", 32), N, N, dtype=dtypes.bfloat16)
   def test_gemm(self): verify_asm_gemm(1, 64, 32, 112)
   def test_gemm_batched(self): verify_asm_gemm(2, 64, 32, 32)
   @needs_second_gpu
@@ -107,7 +107,7 @@ class TestGemm(unittest.TestCase):
 # uses the smallest size for the cdna assembly gemm
 class TestAsmGEMM(unittest.TestCase):
   def setUp(self):
-    if not is_cdna4():
+    if not is_cdna4() or not has_hipcc():
       self.skipTest("assembly gemm is only for cdna4")
 
   def test_tiny(self): verify_asm_gemm(1, 256, 256, 64)
@@ -145,7 +145,7 @@ class TestGemmLlama(unittest.TestCase):
   dtype = dtypes.bfloat16
 
   def setUp(self):
-    if not is_cdna4() or DEV.interface.startswith("MOCK"):
+    if not is_cdna4() or DEV.interface.startswith("MOCK") or not has_hipcc():
       self.skipTest("very slow on non mi350x")
 
   def test_empty(self): asm_gemm(Tensor.empty(N:=getenv("N", 4096), N, dtype=self.dtype), Tensor.empty(N, N, dtype=self.dtype)).realize()
@@ -338,11 +338,15 @@ class TestGemmMXFP8(unittest.TestCase):
   def test_llama_ffn(self): run_mxfp8_gemm(8192, 14336, 4096)
   def test_llama_ffn2(self): run_mxfp8_gemm(8192, 4096, 14336)
   def test_llama_qkv(self): run_mxfp8_gemm(8192, 4096, 4096)
+  def test_general_n_fw(self):
+    for N in (256, 1792, 2048, 8192): run_mxfp8_gemm(8192, N, 4096)
   # backward needs all dims tile-aligned (dgrad reduces N, wgrad reduces M)
   def test_bw_simple(self): run_mx_gemm_bw(256, 256, 256)
   def test_bw_rect(self): run_mx_gemm_bw(512, 256, 512)
   def test_bw_w_post(self): run_mx_gemm_bw(256, 256, 256, w_post=True)
   def test_bw_llama_qkv(self): run_mx_gemm_bw(8192, 4096, 4096)
+  def test_general_n_bw(self):
+    for N in (2048, 8192, 14336): run_mx_gemm_bw(8192, N, 4096)
   # MP sharding: col-parallel (w on out axis), row-parallel (x,w on in axis)
   @needs_second_gpu
   def test_multi_col_parallel(self): run_mx_gemm_multi(512, 512, 512, x_shard=None, w_shard=0, g_shard=1)
@@ -351,23 +355,30 @@ class TestGemmMXFP8(unittest.TestCase):
   @needs_second_gpu
   def test_multi_data_parallel(self): run_mx_gemm_multi(512, 512, 512, x_shard=0, w_shard=None, g_shard=0)
 
-class TestMagicGu(unittest.TestCase):
-  def test_magicgu_matches_old(self):
-    from extra.gemm.cdna_asm_gemm import _magicgu_mulhi, TILE_M, TILE_N, TILE_K
-    old_iters_args = {64: (67108864, 0), 128: (33554432, 0), 224: (613566757, 2147483656)}
-    old_gemm_shapes = [
-      (8192, 4096, 4096), (8192, 14336, 4096), (8192, 4096, 14336),
-      (8192, 8192, 8192), (4096, 4096, 4096), (4096, 14336, 4096),
-      (4096, 14336, 8192), (4096, 4096, 14336), (14336, 4096, 8192),
-      (4096, 8192, 14336), (4096, 4096, 8192), (4096, 8192, 4096),
-    ]
-    for M, N, K in old_gemm_shapes:
-      iters = K // TILE_K
-      total = (M // TILE_M) * (N // TILE_N) * iters
-      for batch in [1, 2]:
-        magic, shift = _magicgu_mulhi(iters, total * batch)
-        old_magic, old_shift = old_iters_args[iters]
-        self.assertEqual((magic, shift), (old_magic, old_shift), f"mismatch for ({M},{N},{K}) batch={batch} iters={iters}")
+def run_atb_gemm(rows, M, N, a_shard=None, b_shard=None, gpus=1, atol=1.0, rtol=3e-2) -> None:
+  import numpy as np
+  Tensor.manual_seed(0)
+  a = Tensor.randn(1, rows, M, dtype=dtypes.float).cast(dtypes.bfloat16)
+  b = Tensor.randn(1, rows, N, dtype=dtypes.float).cast(dtypes.bfloat16)
+  with Context(DEBUG=0): Tensor.realize(a, b)
+  ref = (a[0].float().transpose(0, 1) @ b[0].float()).realize()  # [M, N]
+  if gpus > 1:
+    devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(gpus))
+    a, b = a.shard(devs, axis=a_shard), b.shard(devs, axis=b_shard)
+  out = hk_bf16_atb_gemm(a, b)
+  np.testing.assert_allclose(out.float().numpy(), ref.numpy(), atol=atol, rtol=rtol)
+
+@unittest.skipUnless(has_hipcc(), "MXFP8 gemm requires hipcc to compile")
+class TestHkBf16AtbGemm(unittest.TestCase):
+  def setUp(self):
+    if not is_cdna4(): self.skipTest("hk bf16 atb gemm is cdna4 only")
+  def test_single(self): run_atb_gemm(256, 256, 256)
+  @needs_second_gpu
+  def test_k_sharded(self): run_atb_gemm(512, 256, 256, a_shard=1, b_shard=1, gpus=2)
+  @needs_second_gpu
+  def test_n_sharded(self): run_atb_gemm(256, 256, 512, a_shard=None, b_shard=2, gpus=2)
+  @needs_second_gpu
+  def test_m_sharded(self): run_atb_gemm(256, 512, 256, a_shard=2, b_shard=None, gpus=2)
 
 if __name__ == "__main__":
   unittest.main()
