@@ -21,7 +21,7 @@ mkShell {
     (lib.getLib pkgs.stdenv.cc.cc)  # required for numpy
     (lib.getLib pkgs.llvm)          # libLLVM.so
   ];
-  CUDA_PATH = "${linuxPackages.nvidia_x11}/lib/libcuda.so";
+  CUDA_PATH = "${linuxPackages.nvidiaPackages.legacy_580}/lib/libcuda.so";
   OPENCL_PATH = "${ocl-icd}/lib/libOpenCL.so";
   NVRTC_PATH = "${cudatoolkit}/lib/libnvrtc.so";
   shellHook = ''
