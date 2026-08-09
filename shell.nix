@@ -1,7 +1,7 @@
 with import <nixpkgs> { config.allowUnfree = true; };
 mkShell {
   buildInputs = [
-    clang
+    llvmPackages.clang-unwrapped
     cmake
     cudatoolkit
     loccount
@@ -18,9 +18,10 @@ mkShell {
     uv
   ];
   LD_LIBRARY_PATH = lib.makeLibraryPath [
-    (lib.getLib pkgs.stdenv.cc.cc)  # required for numpy
-    (lib.getLib pkgs.llvm)          # libLLVM.so
+    (lib.getLib pkgs.stdenv.cc.cc)            # required for numpy
+    (lib.getLib pkgs.llvm)                    # libLLVM.so
   ];
+  LIBC_PATH = "${glibc}/lib";
   CUDA_PATH = "${linuxPackages.nvidiaPackages.legacy_580}/lib/libcuda.so";
   OPENCL_PATH = "${ocl-icd}/lib/libOpenCL.so";
   NVRTC_PATH = "${cudatoolkit}/lib/libnvrtc.so";
