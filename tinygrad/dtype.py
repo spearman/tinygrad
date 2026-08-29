@@ -66,7 +66,6 @@ class DType(metaclass=DTypeMetaClass):
   def __reduce__(self): return type(self), tuple(getattr(self, f.name) for f in fields(self))
   def __repr__(self): return f"dtypes.{INVERSE_DTYPES_DICT[self.name]}"
   def __lt__(self, o:DType): return (self.priority, self.bitsize, self.name, self.fmt) < (o.priority, o.bitsize, o.name, o.fmt)
-  def scalar(self) -> DType: return self
   @functools.cached_property
   def min(self):
     if dtypes.is_int(self): return 0 if dtypes.is_unsigned(self) else -2**(self.bitsize-1)
@@ -121,8 +120,6 @@ class DTypes:
   uint32: Final[DType] = DType.new(6, 32, "unsigned int", 'I')
   int64: Final[DType] = DType.new(7, 64, "long", 'q')
   uint64: Final[DType] = DType.new(8, 64, "unsigned long", 'Q')
-  _uint128: Final[DType] = DType.new(8, 128, "uint128", None)
-  _uint256: Final[DType] = DType.new(8, 256, "uint256", None)
   weakfloat: Final[DType] = DType.new(9, 800, "weakfloat", None)
   fp8e4m3: Final[DType] = DType.new(10, 8, "float8_e4m3", None)
   fp8e5m2: Final[DType] = DType.new(11, 8, "float8_e5m2", None)
@@ -222,7 +219,7 @@ def float_to_fp16(x):
 
 def float_to_bf16(x):
   if not math.isfinite(x): return x
-  u = struct.unpack('I', struct.pack('f', x))[0]
+  u = struct.unpack('I', struct.pack('f', truncate[dtypes.float](x)))[0]
   u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
   return struct.unpack('f', struct.pack('I', u))[0]
 

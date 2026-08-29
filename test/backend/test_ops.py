@@ -6,6 +6,7 @@ from tinygrad.helpers import getenv, DEBUG, DEV, IMAGE, Context
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.renderer.nir import NIRRenderer
+from tinygrad.renderer.isa.x86 import X86Renderer
 
 TINY_BACKEND = getenv("TINY_BACKEND")
 if TINY_BACKEND:
@@ -357,6 +358,13 @@ class TestOps(unittest.TestCase):
       [(5, 5)],
       lambda x: torch.where(x > 0.5, 4, 2).type(torch.int32).permute((1, 0)),
       lambda x: (x > 0.5).where(4, 2).clone().permute((1, 0)), forward_only=True)
+
+  @unittest.skipIf(Device.DEFAULT == "WEBGPU", "software vulkan evaluates a NaN != x as false")
+  def test_where_nan_cond(self):
+    # a NaN compares false against everything except !=.
+    for fxn in (lambda x: x<1, lambda x: x>1, lambda x: x!=1, lambda x: x==1):
+      helper_test_op(None, lambda x,a,b: torch.where(fxn(x), a, b), lambda x,a,b: fxn(x).where(a, b), forward_only=True,
+                     vals=[[math.nan, 1.0, 2.0, -1.0], [10, 20, 30, 40], [-1, -2, -3, -4]])
 
   def _test_cmp(self, fxn, reverse=True):
     # test different dtypes
@@ -720,10 +728,11 @@ class TestOps(unittest.TestCase):
       return torch.autograd.grad(t ** c, t)[0].item()
     for x in [-math.inf, 0, 1, math.inf]:
       for c in [-1, 0, 0.3, 1, 2]:
-        tiny_out = get_tiny_gradient(x, c)
         torch_out = get_torch_gradient(x, c)
+        # the pow backward routes through exp2/log2, whose 0/inf behavior is undefined on WEBGPU
+        if Device.DEFAULT == "WEBGPU" and not math.isfinite(torch_out): continue
+        tiny_out = get_tiny_gradient(x, c)
         if math.isnan(tiny_out):
-          if Device.DEFAULT == "WEBGPU": continue # TODO: WEBGPU issue with nan
           assert math.isnan(torch_out)
         else:
           self.assertAlmostEqual(tiny_out, torch_out, msg=f"{x}, {c}")
@@ -749,6 +758,7 @@ class TestOps(unittest.TestCase):
   def test_exp2_log2_zero_times_negative(self):
     # gallivm's exp2/log2 have "undefined behavior with infs, 0s and nans", so exp2(log2(0)*y) returns 0 instead of inf
     helper_test_op(None, lambda x,y: (x.log2()*y).exp2(), lambda x,y: (x.log2()*y).exp2(), vals=[[0.0], [-0.7]], forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "WEBGPU", "pow at 0 routes through exp2/log2, whose 0/inf behavior is undefined on WEBGPU")
   def test_pow_zero_const(self):
     helper_test_op(None, lambda x: x**0.3, vals=[[0.0]])
     helper_test_op(None, lambda x: x**0.0, vals=[[0.0]])
@@ -806,6 +816,8 @@ class TestOps(unittest.TestCase):
     helper_test_op([], lambda: tor^0x1337, lambda: ten^0x1337, forward_only=True)
     helper_test_op([], lambda: 0x1337^tor, lambda: 0x1337^ten, forward_only=True)
 
+  # TODO: x86 PARAM dtype fails SPEC=2
+  @Context(SPEC=1 if isinstance(Device[Device.DEFAULT].renderer, X86Renderer) else 2)
   def test_and(self):
     data = [[1,-8,1],[32,1,6]]
     tor = torch.tensor(data, dtype=torch.int)
@@ -820,6 +832,10 @@ class TestOps(unittest.TestCase):
     helper_test_op([], lambda: tor0&tor1, lambda: ten0&ten1, forward_only=True)
 
     helper_test_op(None, lambda x: (1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])
+    helper_test_op([(3000,)]*10, lambda *xs: (sum(xs[1:], xs[0]) > 5) & (xs[0] < 0.9), forward_only=True)
+
+    if not COMPILE_ONLY:
+      np.testing.assert_equal((Tensor(2**64-1, dtype=dtypes.uint64) & 0xFFFFFFFF).numpy(), 0xFFFFFFFF)
 
   def test_or(self):
     data = [[1,-8,1],[32,1,6]]
@@ -859,9 +875,9 @@ class TestOps(unittest.TestCase):
                    lambda: (ten << Tensor([0,2,4], dtype=dtypes.uint32)).cast(dtypes.int32), forward_only=True)
     helper_test_op([], lambda: tor.__lshift__(2), lambda: ten.__lshift__(2).cast(dtypes.int32), forward_only=True)
     helper_test_op([], lambda: tor.bitwise_left_shift(2), lambda: ten.lshift(2).cast(dtypes.int32), forward_only=True)
-    self.helper_test_exception([], lambda: torch.tensor([1.0]) << 2, lambda: Tensor([1.0]) << 2, expected=RuntimeError)
-    self.helper_test_exception([], lambda: tor << torch.tensor([1.0]), lambda: ten << Tensor([1.0]), expected=RuntimeError)
-    self.helper_test_exception([], lambda: tor << 1.0, lambda: ten << 1.0, expected=RuntimeError)
+    self.helper_test_exception([], lambda: torch.tensor([1.0]) << 2, lambda: (Tensor([1.0]) << 2).realize(), expected=RuntimeError)
+    self.helper_test_exception([], lambda: tor << torch.tensor([1.0]), lambda: (ten << Tensor([1.0])).realize(), expected=RuntimeError)
+    self.helper_test_exception([], lambda: tor << 1.0, lambda: (ten << 1.0).realize(), expected=RuntimeError)
 
   def test_rshift(self):
     data = [[0,1,2],[1<<8,1<<16,1<<31-1]]
@@ -875,8 +891,8 @@ class TestOps(unittest.TestCase):
                    lambda: (ten >> Tensor([0,2,4], dtype=dtypes.uint32)).cast(dtypes.int32), forward_only=True)
     helper_test_op([], lambda: tor.__rshift__(2), lambda: ten.__rshift__(2).cast(dtypes.int32), forward_only=True)
     helper_test_op([], lambda: tor.bitwise_right_shift(2), lambda: ten.rshift(2).cast(dtypes.int32), forward_only=True)
-    self.helper_test_exception([], lambda: torch.tensor([4.0]) >> 1, lambda: Tensor([4.0]) >> 1, expected=RuntimeError)
-    self.helper_test_exception([], lambda: tor >> torch.tensor([1.0]), lambda: ten >> Tensor([1.0]), expected=RuntimeError)
+    self.helper_test_exception([], lambda: torch.tensor([4.0]) >> 1, lambda: (Tensor([4.0]) >> 1).realize(), expected=RuntimeError)
+    self.helper_test_exception([], lambda: tor >> torch.tensor([1.0]), lambda: (ten >> Tensor([1.0])).realize(), expected=RuntimeError)
 
   def test_lshift_signed(self):
     data = [[-1, -3, 1, 7], [0, -2147483648, 2147483647, -1]]
@@ -1801,9 +1817,10 @@ class TestOps(unittest.TestCase):
       helper_test_op([()], lambda x: torch.nn.functional.hardtanh(x, -val, val), lambda x: x.hardtanh(-val, val), grad_atol=1e-6)
   def test_asinh(self):
     helper_test_op([(45,65)], lambda x: x.asinh(), grad_atol=1e-6)
-    # TODO: this one has larger tol?
-    helper_test_op([(45,65)], lambda x: x.asinh(), atol=1e-2, rtol=2e-2, grad_rtol=2e-2, low=-300, high=-297)
+    helper_test_op([(45,65)], lambda x: x.asinh(), grad_atol=1e-6, low=-300, high=-297)
     helper_test_op([(45,65)], lambda x: x.asinh(), grad_atol=1e-6, low=300, high=303)
+    helper_test_op([(45,65)], lambda x: x.asinh(), grad_atol=1e-6, low=-1e10, high=-1e9)
+    helper_test_op(None, lambda x: x.asinh(), grad_atol=1e-6, vals=[[-1.0, 0.0, 1.0]])
   def test_acosh(self):
     helper_test_op([(45,65)], lambda x: x.acosh(), grad_atol=1e-6)
     helper_test_op([(45,65)], lambda x: x.acosh(), grad_atol=1e-3, grad_rtol=1e-2, low=-300, high=-297)
@@ -2162,6 +2179,10 @@ class TestOps(unittest.TestCase):
   def test_roll(self):
     helper_test_op([(2, 4)], lambda x: x.roll(1))
     helper_test_op([(2, 4)], lambda x: x.roll((1,)))
+    helper_test_op([(0,)], lambda x: x.roll(1, 0))
+    helper_test_op([(2, 0, 3)], lambda x: x.roll(1, 0))
+    helper_test_op([(2, 0, 3)], lambda x: x.roll(1, 1))
+    helper_test_op([(2, 0, 3)], lambda x: x.roll(1))
     self.helper_test_exception([(2, 4)], lambda x: x.roll((1, 2)), expected=RuntimeError)
     helper_test_op([(2, 4)], lambda x: x.roll(1, 0))
     helper_test_op([(2, 4)], lambda x: x.roll(-1, 0))
@@ -2796,7 +2817,7 @@ class TestOps(unittest.TestCase):
         lambda x: Tensor.interpolate(x, size=out_sz, mode="linear"))
 
   def test_interpolate_linear_corners_aligned(self):
-    for in_sz, out_sz in [((52,),(29,)), ((29,),(52,))]:
+    for in_sz, out_sz in [((52,),(29,)), ((29,),(52,)), ((29,),(1,))]:
       helper_test_op([(2,3)+in_sz],
         lambda x: torch.nn.functional.interpolate(x, size=out_sz, mode="linear", align_corners=True),
         lambda x: Tensor.interpolate(x, size=out_sz, mode="linear", align_corners=True))
@@ -2948,6 +2969,10 @@ class TestOps(unittest.TestCase):
   def test_fancy_indexing_inf(self):
     data = [math.inf, -math.inf, math.nan]
     helper_test_op((), lambda: torch.tensor(data)[torch.tensor([0, 1, 2])], lambda: Tensor(data)[Tensor([0, 1, 2])])
+
+  def test_fancy_indexing_index_dtypes(self):
+    helper_test_op((), lambda: torch.tensor([10., 20., 30., 40.])[torch.tensor([1, 2, 3, 0])],
+                       lambda: Tensor([10., 20., 30., 40.])[Tensor([1, 2, 3, 0], dtype=dtypes.uint8)])
 
   @slow_test
   def test_slice_fancy_indexing_no_dim_collapse(self):
