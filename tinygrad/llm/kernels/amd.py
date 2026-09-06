@@ -6,6 +6,7 @@ from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
+from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -31,7 +32,7 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "AMD": return False
   # @function contexts set ALLOW_DEVICE_USAGE=0 (scheduling must not open devices); the device is always open here
   with Context(ALLOW_DEVICE_USAGE=1):
-    return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11
+    return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11 and isinstance(Device[device].renderer, HIPRenderer)
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
@@ -70,11 +71,11 @@ class Linear(nn.Linear):
     # scheduling and would copy the entire packed weight on every JIT graph
     if self.ggml_type == Q6_K:
       # Q6 blocks are 210 bytes, so consecutive blocks are only 2-byte aligned. pad each block to 212 bytes
-      # (a one-time copy at load) so the kernel can do all its reads as aligned u32 words
+      # the kernel can do all its reads as aligned u32 words
       nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q6_BYTES
       byte_view = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset)))
-      padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).contiguous().realize()
-      self.weight = Tensor(UOp.from_buffer(cast(Buffer, padded.uop.buf_uop.buffer).view(nblocks * Q6_WORDS, dtypes.uint32, 0)))
+      padded = byte_view.reshape((nblocks, Q6_BYTES)).pad_to((nblocks, Q6_PADDED)).bitcast(dtypes.uint32)
+      self.weight = padded.contiguous().reshape(nblocks * Q6_WORDS)
     else:
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
@@ -100,23 +101,18 @@ class Linear(nn.Linear):
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
-  # int8 4-wide dot, widened to scalar multiply-adds (2% decode slower than the sudot4 builtin, but portable)
-  for i in range(4):
-    av = ((a >> (8*i)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).int()
-    bv = ((b >> (8*i)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).int()
-    c = c + av*bv
-  return c
+  return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg=("__builtin_amdgcn_perm({}, {}, {})", dtypes.uint32))
 
-def _amd_load(ptr:UOp, lanes:int|None=None) -> UOp:
+def _amd_load(ptr:UOp, lanes:int|None=None, stream:bool=False) -> UOp:
   assert ptr.op is Ops.INDEX
   # nontemporal scalar load: streamed weights must not evict the activations/KV cache from L2
   if lanes is None: return ptr.load(arg="nontemporal")
   buf, coords = ptr.src[0], ptr.src[1:]
   idx = sum((coord*math.prod(buf.shape[i+1:]) for i,coord in enumerate(coords)), UOp.const(0))
-  return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load()
+  return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load(arg="nontemporal" if stream else None)
 
 def _load_byte(raw:UOp, base:UOp, offset:UOp) -> UOp: return (raw[base + offset//4] >> ((offset&3)*8).cast(dtypes.uint32)) & 255
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
@@ -152,22 +148,19 @@ def iq4_half_lut(device:str) -> Tensor:
 @functools.cache
 def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
-  token_group, lane = UOp.range(tokens*groups, 0, axis_type=AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token_group, lane = UOp.range(tokens*groups, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   token, group = token_group//groups, token_group%groups
-  x = x.reshape(tokens, groups, 32)
-  group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
-  word_lane = lane.minimum(7)
-  xs = tuple(x[token, group, word_lane*4+i].float() for i in range(4))
-  qs = tuple((v/group_scale).round().clip(-127, 127).cast(dtypes.int8) for v in xs)
-  word = sum((v.cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i, v in enumerate(qs)), UOp.const(0, dtypes.uint32))
-  # per-16 sums of the quantized values (lanes 0-3 / 4-7): Q4_K/Q5_K need the 32-sum, Q6_K the 16-sums
-  part = (lane < 8).where(sum((v.cast(dtypes.int32) for v in qs), UOp.const(0, dtypes.int32)), UOp.const(0, dtypes.int32))
-  gsum = [warp_reduce(((lane & 4).eq(h*4)).where(part, UOp.const(0, dtypes.int32)), full_wave=True) for h in range(2)]
-  store_half = (lane & 4) >> 2
-  stores = (q[token, group, lane.valid(lane < 8)].store(word),
-            UOp.group(scale[token, group.valid(lane.eq(0))].store(group_scale),
-                      xsum[token, group, store_half.valid(lane.eq(0) | lane.eq(4))].store(
-                        store_half.eq(0).where(gsum[0].float(), gsum[1].float()))))
+  value = x.reshape(tokens, groups, 32)[token, group, lane].float()
+  # Quantize each input once, then pack four neighboring lanes into one word.
+  d = (warp_reduce(value.abs(), maximum=True, full_wave=True)/127).maximum(1e-8)
+  rounded = UOp(Ops.CUSTOM, src=(value/d,), arg=("__builtin_nearbyintf({0})", dtypes.float))
+  quant = rounded.clip(-127, 127).cast(dtypes.int8)
+  word = quant.cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
+  for offset in (1, 2):
+    word |= UOp(Ops.CUSTOM, src=(word,), arg=(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | offset<<10})", dtypes.uint32))
+  stores = (q[token, group, (lane//4).valid((lane%4).eq(0))].store(word),
+            scale[token, group.valid(lane.eq(0))].store(d),
+            xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
@@ -221,8 +214,8 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
     # the packed rows were padded to 212 bytes (53 words) per 256-block in set_quantized: everything is word-aligned
     base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_WORDS
     # the subgroup's 8 ql words and 8 qh words are contiguous: two 16-byte vector loads each
-    lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4) for half in range(2))
-    highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4) for half in range(2))
+    lows = tuple(_amd_load(raw[base + (subgroup//4)*16 + (subgroup%2)*8 + half*4], 4, stream=True) for half in range(2))
+    highs = tuple(_amd_load(raw[base + 32 + (subgroup//4)*8 + half*4], 4, stream=True) for half in range(2))
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       within = (subgroup*32 + word_idx*4)%128
@@ -332,7 +325,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
   tokens = int(x.numel()) // layer.in_features
-  raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
+  raw, out_features, in_features = layer.weight.uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
@@ -408,7 +401,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   live_chunks = (valid_kv_len+CHUNK-1)//CHUNK
   live_chunks = min(live_chunks, out.shape[2]) if isinstance(live_chunks, int) else live_chunks.minimum(out.shape[2])
   block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
-  lane, wave = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
+  lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
   b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
   # per-lane query fragments for every GQA head, kept packed in registers; unpacked at use
   qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
@@ -422,7 +415,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     valids.append(valid)
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
-    vfrags[j] = _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL)
+    vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
     for h in range(G):
       s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
       scores[j][h] = valid.where(s, UOp.const(-math.inf, dtypes.float))
@@ -540,7 +533,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
   q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
   k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
-  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk)
+  # All waves must finish reading Q/K before their shared memory is reused for P/V.
+  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk).barrier()
   S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
   rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
   q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + rm * LANES_PER_WAVE_M + lane_m
