@@ -22,7 +22,7 @@ def fold_divmod_general(d: UOp) -> UOp|None:
   # these rules strictly require y to be a scalar constant > 0
   if y.op is Ops.CONST and (c := y.val) > 0:
     # nested_div: (x%(k*c))//c -> (x//c)%k (requires k>0); the mod case is handled by remove_nested_mod below
-    if d.op is Ops.FLOORDIV and x.op is Ops.FLOORMOD and (k := x.src[1].divides(c)) is not None and k > 0: return x.src[0] // y % k
+    if d.op is Ops.FLOORDIV and x.op is Ops.FLOORMOD and (k := x.src[1].divides(c)) is not None and k.vmin > 0: return x.src[0] // y % k
 
     # remove_nested_mod in sum: (a%4 + b)%2 -> (a+b)%2
     if d.op is Ops.FLOORMOD:
@@ -98,7 +98,7 @@ def fold_divmod_general(d: UOp) -> UOp|None:
 div_and_mod_symbolic = PatternMatcher([
   # ** 1. Fast Inline Rules **
   # (x//c+a)//d -> (x+a*c)//(c*d) for c>0, d>0
-  ((UPat.var("x")//UPat.cvar("c") + UPat.cvar("a"))//UPat.cvar("d"), lambda x,c,a,d: (x+a*c)//(c*d) if d.vmin>0 else None),
+  ((UPat.var("x", dtypes.weakint)//UPat.cvar("c") + UPat.cvar("a"))//UPat.cvar("d"), lambda x,c,a,d: (x+a*c)//(c*d) if d.vmin>0 else None),
   # (x+c)//d -> (x+c%d)//d + c//d ; (x+c)%d -> (x+c%d)%d  (split the multiple of d out of the const, holds for any d!=0)
   (UPat((Ops.FLOORDIV, Ops.FLOORMOD), src=(UPat.var("x", dtypes.weakint)+UPat.cvar("c"), UPat.cvar("d")), name="n"),
     lambda n,x,c,d: None if d.val==0 or c.val%d.val==c.val else
