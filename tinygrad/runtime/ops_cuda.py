@@ -98,7 +98,9 @@ class CUDADevice(Compiled):
     if api is cuda: # signals and waits are 64-bit stream memory ops, without them every sync times out
       attr = cuda.CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS
       if not init_c_var(ctypes.c_int, lambda x: check(api.cuDeviceGetAttribute(ctypes.byref(x), attr, self.cu_device))).value:
-        raise RuntimeError(f"{device} does not support 64-bit stream memory operations")
+        check(api.cuDeviceGetName(name:=ctypes.create_string_buffer(256), 256, self.cu_device))
+        raise RuntimeError(f"CUDA:{device_id} ({name.value.decode()}, {self.get_arch(device_id)}) lacks 64-bit stream memory operations, "
+                           "which tinygrad's CUDA backend requires")
     self.context = init_c_var(api.CUcontext, lambda x: check(api.cuCtxCreate_v2(ctypes.byref(x), 0, self.cu_device)))
     self.streams = [init_c_var(api.CUstream, lambda x: check(api.cuStreamCreate(ctypes.byref(x), cuda.CU_STREAM_NON_BLOCKING))) for _ in range(2)]
     super().__init__(device, CUDAAllocator(self), self.renderers, None, arch=self.get_arch(device_id))
