@@ -66,6 +66,10 @@ class TestVminVmaxProperties(unittest.TestCase):
     self.assertEqual(uop.vmin, 0)
     self.assertEqual(uop.vmax, 16)
 
+    uop = x & -4
+    self.assertEqual(uop.vmin, 0)
+    self.assertEqual(uop.vmax, 20)
+
   def test_vmin_vmax_and_with_negative_variable(self):
     # when mask doesn't have sign bit set, result is always non-negative
     x = UOp.variable('x', -100, 100, dtypes.int32)
@@ -220,6 +224,16 @@ class TestVminVmaxProperties(unittest.TestCase):
     x = UOp.const((0, 4, Invalid, Invalid))
     self.assertEqual((x.vmin, x.vmax), (0, 4))
 
+  def test_vmin_vmax_masked_read(self):
+    # a masked lane reads 0 or the load's alt, not the storage
+    p, t, r = UOp.param(0, dtypes.int, 4, vmin_vmax=(3, 7)), UOp(Ops.BINARY, arg=bytes([3, 4, 5, 6])), UOp.range(4, 0)
+    self.assertEqual(p.index(r)._min_max, (3, 7))
+    self.assertEqual(p.index(r.valid(r < 2))._min_max, (0, 7))
+    self.assertEqual(t.index(r).load()._min_max, (3, 6))
+    self.assertEqual(t.index(r.valid(r < 2)).load()._min_max, (0, 255))
+    self.assertEqual(t.index(r.valid(r < 2)).cast(dtypes.int8).load()._min_max, (-128, 127))
+    self.assertEqual(t.index(r).load(UOp.const(0, dtypes.uchar), r < 2)._min_max, (0, 255))
+
 class TestVminVmaxDivMod(unittest.TestCase):
   def test_vmin_vmax_division_positive(self):
     # vmin and vmax for division of a variable by a positive constant
@@ -248,14 +262,14 @@ class TestVminVmaxDivMod(unittest.TestCase):
 
   def test_vmin_vmax_floordiv_floormod(self):
     x = UOp.variable('x', -7, 7)
-    floordiv = x.alu(Ops.FLOORDIV, UOp.const(3))
+    floordiv = x.alu(Ops.DIV, UOp.const(3))
     self.assertEqual(floordiv.vmin, -3)
     self.assertEqual(floordiv.vmax, 2)
-    floormod = x.alu(Ops.FLOORMOD, UOp.const(3))
+    floormod = x.alu(Ops.MOD, UOp.const(3))
     self.assertEqual(floormod.vmin, 0)
     self.assertEqual(floormod.vmax, 2)
     # negative const divisor: floormod range is [c+1, 0]
-    floormod_neg = x.alu(Ops.FLOORMOD, UOp.const(-3))
+    floormod_neg = x.alu(Ops.MOD, UOp.const(-3))
     self.assertEqual(floormod_neg.vmin, -2)
     self.assertEqual(floormod_neg.vmax, 0)
 
@@ -420,10 +434,6 @@ class TestConstFactor(unittest.TestCase):
     uop = (x * 3) * 5
     self.assertEqual(uop.const_factor(), 15)  # Constant multipliers are combined (3 * 5 = 15)
 
-  def test_const_factor_variable_multiple_of(self):
-    x = UOp.variable('x', 16, 32, multiple_of=4)
-    self.assertEqual(x.const_factor(), 4)
-
 class TestDivides(unittest.TestCase):
   def test_divides_constant_exact(self):
     # Divides a constant by an exact divisor
@@ -461,16 +471,6 @@ class TestDivides(unittest.TestCase):
     uop = x * 4
     result = uop.divides(3)
     self.assertIsNone(result)  # Cannot divide by 3, since 4 is not divisible by 3
-
-  def test_divides_variable_multiple_of_exact(self):
-    x = UOp.variable('x', 16, 32, multiple_of=4)
-    result = x.divides(4)
-    self.assertIsNotNone(result)
-
-  def test_divides_variable_multiple_of_factor(self):
-    x = UOp.variable('x', 16, 32, multiple_of=4)
-    result = x.divides(2)
-    self.assertIsNotNone(result)
 
 if __name__ == '__main__':
   unittest.main()

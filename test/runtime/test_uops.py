@@ -125,7 +125,7 @@ class TestFloatUOps(TestUOps):
   def test_log2(self): self._test_uop_fxn(Ops.LOG2, lambda a: math.log2(a) if a > 0 else float('-inf' if a==0 else 'nan'))
   @unittest.skipIf(Device.DEFAULT == "CPU", 'not supported as uop')
   def test_sin(self): self._test_uop_fxn(Ops.SIN, lambda a: math.sin(a))
-  def test_recip(self): self._test_uop_fxn(Ops.RECIPROCAL, lambda a: 1/a if a != 0 else float('inf'))
+  def test_recip(self): self._test_uop_fxn(Ops.RECIP, lambda a: 1/a if a != 0 else float('inf'))
   def test_sqrt(self): self._test_uop_fxn(Ops.SQRT, lambda a: math.sqrt(a) if a >= 0 else float('nan'))
   def test_sqrt_edgecases(self):
     for a, expected in [(-math.inf, math.nan), (-1., math.nan), (0., 0.), (4., 2.), (math.inf, math.inf), (math.nan, math.nan)]:
@@ -156,11 +156,11 @@ class TestNonFloatUOps(TestUOps):
   @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, (PTXRenderer, CStyleLanguage)), "only ptx and cstyle use bitshifts")
   def test_shl_int32(self): self._test_bop_fxn(Ops.SHL, lambda a,b: int(a)<<int(b), (dtypes.int32, dtypes.int32), no_b_neg=True)
   def test_div_int32(self):
-    self._test_bop_fxn(Ops.CDIV, lambda a,b: int(a/b), (dtypes.int32, dtypes.int32), no_b_zero=True)
+    self._test_bop_fxn(Ops.TRUNCDIV, lambda a,b: int(a/b), (dtypes.int32, dtypes.int32), no_b_zero=True)
   def test_and_int32(self): self._test_bop_fxn(Ops.AND, lambda a,b: int(a)&int(b), (dtypes.int32, dtypes.int32))
   def test_or_int32(self): self._test_bop_fxn(Ops.OR, lambda a,b: int(a)|int(b), (dtypes.int32, dtypes.int32))
   def test_mod_int32(self):
-    self._test_bop_fxn(Ops.CMOD,
+    self._test_bop_fxn(Ops.TRUNCMOD,
                        lambda a,b: abs(int(a))%abs(int(b))*(1,-1)[a<0], (dtypes.int32, dtypes.int32), no_b_zero=True)
   def test_cmplt_int32(self): self._test_bop_fxn(Ops.CMPLT, lambda a,b: int(a)<int(b), (dtypes.int32, dtypes.int32))
   def test_cmpne_int32(self): self._test_bop_fxn(Ops.CMPNE, lambda a,b: int(a)!=int(b), (dtypes.int32, dtypes.int32))
@@ -230,6 +230,18 @@ class TestZeroRange(unittest.TestCase):
 class TestUOpPrograms(unittest.TestCase):
   def _run(self, prog:UOp, *tensors:Tensor):
     run_linear(UOp(Ops.LINEAR, src=(prog.call(*[t.realize().uop.buf_uop for t in tensors]),)), update_stats=False)
+
+  def test_masked_read_of_bounded_param(self):
+    out, a = Tensor.empty(4, dtype=dtypes.int), Tensor([4, 5, 6, 7])
+    O, A, i = out.uop.placeholder_like(0), UOp.param(1, dtypes.int, 4, vmin_vmax=(3, 7)), UOp.range(4, 0)
+    self._run(O[i].store((A.index(i.valid(i < 2)) > 0).cast(dtypes.int)).end(i).sink(arg=KernelInfo()), out, a)
+    self.assertEqual(out.tolist(), [1, 1, 0, 0])
+
+  def test_masked_read_of_constant_table(self):
+    out = Tensor.empty(4, dtype=dtypes.int)
+    O, T, i = out.uop.placeholder_like(0), UOp(Ops.BINARY, arg=bytes([3, 4, 5, 6])), UOp.range(4, 0)
+    self._run(O[i].store((T.index(i.valid(i < 2)).load() > 0).cast(dtypes.int)).end(i).sink(arg=KernelInfo()), out)
+    self.assertEqual(out.tolist(), [1, 1, 0, 0])
 
   def test_simple(self):
     out = Tensor.empty(10,10,dtype=dtypes.int)
