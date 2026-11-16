@@ -109,6 +109,8 @@ class CUDADevice(Compiled):
 
   def get_arch(self, device_id:int) -> str:
     check(cuda.cuDeviceComputeCapability(ctypes.byref(major:=ctypes.c_int()), ctypes.byref(minor:=ctypes.c_int()), device_id))
+    check(cuda.cuDeviceGetAttribute(ctypes.byref(ops:=ctypes.c_int()), cuda.CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, device_id))
+    assert ops.value, f"CUDA:{device_id}: Unsupported arch: sm_{major.value}{minor.value} lacks 64-bit stream memory ops"
     return f"sm_{major.value}{minor.value}"
 
   @functools.cache
