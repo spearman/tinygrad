@@ -3,6 +3,7 @@ from dataclasses import replace
 from typing import cast
 from tinygrad.helpers import OSX, mv_address, flatten, to_tuple, unwrap, ceildiv
 from tinygrad.device import BufferStorage, MMIOInterface, Compiled, Allocator, Buffer, BufferSpec, Device, HCQ_RUNTIME_DEV
+from tinygrad.device import is_iface_usb
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
 from tinygrad.runtime.support.hcq2 import ccall, ins, patch
@@ -17,10 +18,10 @@ class DiskDevice(Compiled):
     self.size: int|None = None
     self.fd: int|None = None
     self.refcount, self.info = 0, Buffer(HCQ_RUNTIME_DEV.device, 16, options=BufferSpec(nolru=True)) # info: [fd, mmap address] for batch reads
-    super().__init__(device, DiskAllocator(self), [], None)
+    super().__init__(device, DiskAllocator(self), None)
   def _might_open(self, size:int):
     assert self.size is None or size <= self.size, f"can't reopen Disk tensor with larger size, opened with {self.size}, tried to open with {size}"
-    if self.size is not None and hasattr(self, "mem"):
+    if self.size is not None:
       self.refcount += 1
       return
     filename = self.device[len("disk:"):]
@@ -43,9 +44,8 @@ class DiskDevice(Compiled):
     self.refcount -= 1
     if self.refcount == 0:
       if self.fd is not None: os.close(self.fd)
-      if hasattr(self, "mem"):
-        try: self.mem.close()
-        except BufferError: pass
+      try: self.mem.close()
+      except BufferError: pass
       self.size = None
 
 class DiskBuffer:
@@ -115,14 +115,14 @@ def disk_read(file:UOp, srcs:UOp, counts:UOp, rings:UOp, sqes:UOp) -> UOp: # src
 
 def is_disk_read(c:UOp) -> bool:
   dev, src = [to_tuple(b.device)[0] for b in c.src[1:3]] if c.op is Ops.CALL and c.body.op is Ops.STORE else ("", "")
-  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and Device[dev].has_copy_queue and not dev.startswith("NULL") and bool(uring()) \
-    and not getattr(Device[dev], "is_usb", False)
+  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and not dev.startswith("NULL") and bool(uring()) \
+    and bool(Device.target_for(dev).get("copy", 1)) and not is_iface_usb(dev)
 
 def disk_copy_rewriter(s:UOp) -> UOp|None:
   lin = s.without_after.body
   if not (copies:=[c for c in lin.src if is_disk_read(c)]): return None
-  rings = UOp.alloc((unwrap(uring())[2].nbytes // 4,), dtypes.uint32, 0, device=HCQ_RUNTIME_DEV.device, name="uring_rings")
-  sqes = UOp.alloc((8 * RING_ENTRIES,), dtypes.uint64, 0, device=HCQ_RUNTIME_DEV.device, name="uring_sqes")
+  rings = UOp.extern((unwrap(uring())[2].nbytes // 4,), dtypes.uint32, HCQ_RUNTIME_DEV.device, "uring_rings")
+  sqes = UOp.extern((8 * RING_ENTRIES,), dtypes.uint64, HCQ_RUNTIME_DEV.device, "uring_sqes")
 
   # [mmap address, bytes] per copy in a table: an arg each would hit ctypes' 1024 limit
   words = flatten((c.src[2].getaddr(HCQ_RUNTIME_DEV.device), UOp.const(c.src[2].nbytes(), dtypes.uint64)) for c in copies)
@@ -131,12 +131,12 @@ def disk_copy_rewriter(s:UOp) -> UOp|None:
 
   # [chunks read, chunks copied] at the start of the gpu's stage
   dev = s.without_after.src[1].device
-  counts = UOp.alloc((STAGE_SZ,), dtypes.uint8, 0, device=dev, name="disk_stage")[:16].bitcast(dtypes.uint64)
+  counts = UOp.extern((STAGE_SZ,), dtypes.uint8, dev, "disk_stage")[:16].bitcast(dtypes.uint64)
 
   # cpu part
   done, off, gpu_ops = s, 0, collections.defaultdict[UOp, list[UOp]](list)
   for disk, grp in itertools.groupby(range(len(copies)), lambda k: to_tuple(copies[k].src[2].device)[0]):
-    file, ks = UOp.alloc((2,), dtypes.uint64, 0, device=disk, name="disk_info"), list(grp)
+    file, ks = UOp.extern((2,), dtypes.uint64, disk, "disk_info"), list(grp)
     done = disk_read(file, srcs[2 * ks[0]:2 * ks[-1] + 2], counts.after(done), rings, sqes)
 
   # gpu part
@@ -159,7 +159,7 @@ def shared(fd:int, at:int, n:int) -> Buffer: # n bytes of memory the kernel shar
 @functools.cache
 def uring() -> tuple[int, io_uring.struct_io_uring_params, Buffer, Buffer]|None: # fd, offsets, the rings (heads, tails, cqes), the sqes
   if sys.platform != "linux" or hasattr(sys, "getandroidapilevel"): return None
-  p = io_uring.struct_io_uring_params(flags=io_uring.IORING_SETUP_NO_SQARRAY)  # type: ignore[unreachable]
+  p = io_uring.struct_io_uring_params(flags=io_uring.IORING_SETUP_NO_SQARRAY)
   if (fd:=libc.syscall(io_uring.NR_io_uring_setup, RING_ENTRIES, ctypes.byref(p))) < 0: return None
   return fd, p, shared(fd, io_uring.IORING_OFF_SQ_RING, p.cq_off.cqes + 16 * p.cq_entries), shared(fd, io_uring.IORING_OFF_SQES, 64 * RING_ENTRIES)
 

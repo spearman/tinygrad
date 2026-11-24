@@ -71,7 +71,7 @@ def group_gpudims(ctx:Renderer, s:UOp):
   idxs = get_grouped_dims("gidx", global_shape, global_max, reverse=True) + local_idxs
 
   # apply to multiple ranges
-  subs, masks = {}, {}
+  subs, masks, idx_of = {}, {}, dict(zip(global_dims+local_dims, idxs))
   for r in s_topo:
     # look for local INDEXes that are not used in the GLOBAL store, then add them as an INVALID
     if r.op is Ops.STORE and len((idx := r.src[0]).src) and idx.src[0].addrspace == AddrSpace.GLOBAL:
@@ -80,22 +80,12 @@ def group_gpudims(ctx:Renderer, s:UOp):
         assert len(idx.src) == 2, "index has 2 sources"
         mask: UOp = UOp.uprod(*[x.eq(0) for x in missing_locals])
         masks[idx] = idx.replace(src=(idx.src[0], idx.src[1].valid(mask)))
-    if r.op is not Ops.RANGE: continue
-    try:
-      ii = (global_dims+local_dims).index(r.arg)
-      subs[r] = idxs[ii]
-    except ValueError: continue
+    if r.op is Ops.RANGE and r.arg in idx_of: subs[r] = idx_of[r.arg]
   # Hardware ids may coincide with logical ids: replace ranges simultaneously, including those in the new masks.
   return s.substitute(masks).substitute(subs, walk=True)
 
-pm_device_to_var = PatternMatcher([
-  # the DEVICE axis is not a program axis, it's bound per device at launch. lower it to the _device_num variable (like SPECIAL for devices)
-  (UPat(Ops.RANGE, name="r"),
-   lambda r: UOp.variable("_device_num", 0, r.vmax, dtype=r.dtype) if r.axis_type is AxisType.DEVICE else None),
-])
-
 # Run once: grouping creates new GLOBAL/LOCAL ranges, which must not be grouped again.
-pm_group_gpudims = PatternMatcher([(UPat(Ops.SINK, name="s"), group_gpudims)])+pm_device_to_var
+pm_group_gpudims = PatternMatcher([(UPat(Ops.SINK, name="s"), group_gpudims)])
 
 pm_range_to_special = PatternMatcher([
   (UPat(Ops.RANGE, name="r"), lambda r: r.replace(op=Ops.SPECIAL, arg=f"{'g' if r.axis_type is AxisType.GLOBAL else 'l'}idx{r.axis_id[-1]}")

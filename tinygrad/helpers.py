@@ -50,6 +50,15 @@ def ansilen(s:str): return len(ansistrip(s))
 def ansipad(s:str, w:int): return s+' '*max(w-ansilen(s), 0)
 def make_tuple(x:int|Sequence[int], cnt:int) -> tuple[int, ...]: return (x,)*cnt if isinstance(x, int) else tuple(x)
 def to_tuple(x:T|tuple[T, ...]) -> tuple[T, ...]: return x if isinstance(x, tuple) else (x,)
+def is_disk_device(device:str|tuple[str, ...]) -> bool: return any(d.split(":", 1)[0].upper() in ("DISK", "NVME") for d in to_tuple(device))
+@functools.cache
+def canonicalize_device_name(device:str) -> str: return re.sub(r":0$", "", (d:=device.split(":", 1)[0].upper()) + device[len(d):])
+def canonicalize_device(device:str|tuple|list|None) -> str|tuple[str, ...]:
+  if device is None:
+    from tinygrad.device import Device  # the default device is selected by opening the devices
+    device = Device.DEFAULT
+  if not isinstance(device, (tuple, list)): return canonicalize_device_name(device)
+  return canonical[0] if len(canonical:=tuple(canonicalize_device_name(d) for d in device)) == 1 else canonical
 def flatten(l:Iterable[Iterable[T]]): return [item for sublist in l for item in sublist]
 def fully_flatten(l):
   if not (hasattr(l, "__len__") and hasattr(l, "__getitem__")) or isinstance(l, str): return [l]
@@ -66,7 +75,7 @@ def strip_parens(fst:str) -> str: return fst[1:-1] if fst[:1]=='(' and fst[-1:]=
 def ceildiv(num, amt):
   # use (num + amt - 1) // amt when num is a UOp and non-negative to avoid C/Python division mismatch
   if hasattr(num, 'vmin') and num.vmin >= 0 and (amt > 0 if isinstance(amt, int) else amt.vmin > 0): return (num + amt - 1) // amt
-  return int(ret) if isinstance((ret:=-(num//-amt)), float) else ret
+  return math.ceil(num / amt) if any(isinstance(x, float) for x in (num, amt)) else -(num//-amt)
 def round_up(num:int, amt:int) -> int: return (num+amt-1)//amt * amt
 def round_down(num:int, amt:int) -> int: return -round_up(-num, amt)
 def next_power2(x): return 1 if x == 0 else 1 << (x - 1).bit_length()
@@ -121,7 +130,6 @@ def canonicalize_strides(shape:tuple[T, ...], strides:tuple[T, ...]) -> tuple[T,
 
 @functools.cache
 def strides_for_shape(shape:tuple[T, ...]) -> tuple[T, ...]:
-  if not shape: return ()
   strides = tuple(itertools.accumulate(reversed(shape[1:]), operator.mul, initial=1))[::-1]
   return canonicalize_strides(shape, strides)
 
@@ -151,7 +159,7 @@ def select_first_inited(candidates:Sequence[Callable[...,T]], err_msg:str, cache
 def pluralize(st:str, cnt:int): return f"{cnt} {st}"+('' if cnt == 1 else 's')
 
 # for length N coefficients `p`, returns p[0] * x**(N-1) + p[1] * x**(N-2) + ... + p[-2] * x + p[-1]
-def polyN(x:T, p:list[float]) -> T: return functools.reduce(lambda acc,c: acc*x+c, p, 0.0)  # type: ignore
+def polyN(x:T, p:list[float]) -> T: return functools.reduce(lambda acc,c: acc*x+c, p)  # type: ignore
 
 @functools.cache
 def to_function_name(s:str): return ''.join([c if c in (string.ascii_letters+string.digits+'_') else f'{ord(c):02X}' for c in ansistrip(s)])
@@ -203,6 +211,7 @@ class Target:
   arch: str = ""
   interface: str = ""
   indices: str = ""
+  props: str = ""
 
   @staticmethod
   def parse(s:str) -> Target:
@@ -210,14 +219,15 @@ class Target:
       (iface, indices), s = ((iface_split[0], iface_split[1]) if len(iface_split:=split[0].rsplit(":", 1)) == 2 else (split[0], ""), split[1])
     elif len(split) > 2: raise RuntimeError(f"too many '+' in target string: {s!r}")
     else: iface, indices = "", ""
-    match [x.upper() if i < 2 else x for i,x in enumerate(s.split(':'))]:
-      case [dev, ren, arch]: return Target(dev, ren, arch, iface, indices)
-      case [dev, ren]: return Target(dev, ren, interface=iface, indices=indices)
-      case [dev]: return Target(dev, interface=iface, indices=indices)
-      case _: raise RuntimeError(f"too many ':' in target string: {s!r}")
+    if len(parts:=s.split(':')) > 4: raise RuntimeError(f"too many ':' in target string: {s!r}")
+    dev, ren, arch, props = parts + [""]*(4-len(parts))
+    return Target(dev.upper(), ren.upper(), arch, iface, indices, props)
   def __repr__(self):
-    fst, snd = re.sub(":*$", "", ":".join([self.interface, self.indices])), re.sub(":*$", "", ":".join([self.device, self.renderer, self.arch]))
+    fst, snd = ":".join([self.interface, self.indices]).rstrip(":"), ":".join([self.device, self.renderer, self.arch, self.props]).rstrip(":")
     return (fst + "+" if fst else "") + snd
+  @property
+  def opts(self) -> dict[str, str]: return dict(x.split("=", 1) for x in self.props.split(",") if x)
+  def get(self, key:str, default:Any="") -> Any: return type(default)(self.opts.get(key, default))
   # replaces if not already set
   def replacedefault(self, **kwargs) -> Target: return replace(self, **{k:v for k,v in kwargs.items() if not getattr(self, k)})
 
@@ -234,7 +244,8 @@ class _DEV(ContextVar):
   def target(self, dev:str, **kwargs) -> Target:
     assert (v:=getenv(k:=f"{dev}_CC", "")) == "", \
       f"{k}={v} is deprecated, use DEV='{';'.join([repr(t) for t in self._value if t.device and t.device != dev] + [f'{dev}:{v}'])}' instead"
-    return replace(next((t for t in self._value if not t.device or t.device == dev), Target(device=dev)).replacedefault(**kwargs), device=dev)
+    t = next((t for t in self._value if not t.device or t.device == dev), Target(device=dev))
+    return t if t.device == dev and not kwargs else replace(t.replacedefault(**kwargs), device=dev)
 
 DEV, DEBUG, BEAM, NOOPT = _DEV("DEV", ""), ContextVar("DEBUG", 0), ContextVar("BEAM", 0), ContextVar("NOOPT", 0)
 IMAGE, FLOAT16, OPENPILOT_HACKS = ContextVar("IMAGE", 0), ContextVar("FLOAT16", 0), ContextVar("OPENPILOT_HACKS", 0)
@@ -245,7 +256,7 @@ USE_TC, TC_SELECT, TC_OPT, TC_MIN_GLOBALS = ContextVar("TC", 1), ContextVar("TC_
 TRANSCENDENTAL = ContextVar("TRANSCENDENTAL", 1)
 SPLIT_REDUCEOP, NO_MEMORY_PLANNER, LRU = ContextVar("SPLIT_REDUCEOP", 1), ContextVar("NO_MEMORY_PLANNER", 0), ContextVar("LRU", 1)
 RING, ALL2ALL, ALLREDUCE_CAST = ContextVar("RING", 1), ContextVar("ALL2ALL", 0), ContextVar("ALLREDUCE_CAST", 1)
-ALLREDUCE_NODE_NDEVS = ContextVar("ALLREDUCE_NODE_NDEVS", 0) # gpus per node, the nodes cabled gpu k to gpu k
+NODE_NDEVS = ContextVar("NODE_NDEVS", 0) # gpus per node, the nodes cabled gpu k to gpu k
 CACHELEVEL, IGNORE_BEAM_CACHE = ContextVar("CACHELEVEL", 2), ContextVar("IGNORE_BEAM_CACHE", 0)
 VALIDATE_WITH_CPU = ContextVar("VALIDATE_WITH_CPU", 0)
 HCQ_RUNTIME_DEV = _DEV("HCQ_RUNTIME_DEV", "CPU:TCC" if sys.platform == "linux" and _has_lib("tcc") else "CPU:LLVM")
@@ -291,6 +302,8 @@ SCACHE = ContextVar("SCACHE", 1)
 USE_ATOMICS = ContextVar("USE_ATOMICS", 0)
 # don't allow broadcast
 DISALLOW_BROADCAST = ContextVar("DISALLOW_BROADCAST", 0)
+# set to 0 to disable optional slopkernels
+SLOP = ContextVar("SLOP", 1)
 
 # **************** global state Counters ****************
 
@@ -396,7 +409,7 @@ if getenv("DEBUG_GC"):
 cache_dir: str = os.path.join(getenv("XDG_CACHE_HOME", os.path.expanduser("~/Library/Caches" if OSX else "~/.cache")), "tinygrad")
 CACHEDB: str = getenv("CACHEDB", os.path.abspath(os.path.join(cache_dir, "cache.db")))
 
-VERSION = 24
+VERSION = 25
 _db_connection = threading.local()
 def db_connection():
   if (conn:=getattr(_db_connection, "conn", None)) is None:
@@ -567,7 +580,6 @@ def to_mv(ptr:int, sz:int) -> memoryview: return memoryview((ctypes.c_uint8 * sz
 def mv_address(mv): return ctypes.addressof(ctypes.c_char.from_buffer(mv))
 def to_char_p_p(options: list[bytes], to_type=ctypes.c_char):
   return (ctypes.POINTER(to_type) * len(options))(*[ctypes.cast(ctypes.create_string_buffer(o), ctypes.POINTER(to_type)) for o in options])
-def flat_mv(mv:memoryview): return mv if len(mv) == 0 else mv.cast("B", shape=(mv.nbytes,))
 
 # *** tqdm
 

@@ -5,7 +5,8 @@ from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Compiled, ProfileGraphEvent
 from tinygrad.helpers import Context, unwrap, to_tuple
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, ParamArg
+from tinygrad.uop.uir import render_uir, parse_uir
 from tinygrad.engine.realize import compile_linear, get_call_arg_uops, lower_and_compile, run_linear
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQInfo
@@ -50,7 +51,7 @@ def submits(batch:UOp) -> list[UOp]: # the submit calls of a batch sink in order
   return calls
 def queues(batch:UOp) -> dict[tuple[str, str], list[UOp]]:
   return {(q.device, q.arg.name): list(c.body.src) for c in submits(batch.body) for q in [c.src[1]]}
-def ins_name(c:UOp) -> str|None: return c.body.arg.name if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION else None
+def ins_name(c:UOp) -> str|None: return c.body.arg.code if c.op is Ops.CALL and c.body.op is Ops.NATIVE else None
 def calls(batch:UOp) -> list[UOp]: return [c for cmds in queues(batch).values() for c in cmds if c.op is Ops.CALL and ins_name(c) is None]
 def devices_of(call:UOp) -> set[str]: return {to_tuple(a.device)[0] for a in get_call_arg_uops(call)}
 
@@ -182,10 +183,16 @@ class TestHCQ2Schedule(unittest.TestCase):
     self.assertEqual(len([x for x in run(b, done={"NULL": T - 1})[0] if isinstance(x, int)]), 1)
 
   def test_a_device_without_a_copy_queue_copies_with_a_kernel(self):
-    with patch.object(type(Device["NULL"]), "has_copy_queue", property(lambda _: False)):
+    with patch.dict(Device["NULL"].props, {"copy": 0}):
       b = self.batch((self.x.to("NULL:1") + 1).contiguous())
     self.assertTrue(all(c.body.op is Ops.PROGRAM for c in calls(b)))
     self.assertEqual(orders(b), {(0, 1)})
+
+  def test_copy_kernel_to_host_runs_on_source(self):
+    with patch.dict(Device["NULL"].props, {"copy": 0}):
+      b = self.batch(self.x.to("CPU"))
+    copy, = calls(b)
+    self.assertIn(copy, queues(b)[("NULL", "COMPUTE:0")])
 
   def test_a_host_kernel_splits_the_batch(self):
     self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("PYTHON") + 2).contiguous().to("NULL") + 3)), 2)
@@ -219,6 +226,12 @@ class TestHCQ2Link(unittest.TestCase):
   def setUp(self): self.enterContext(Context(DEV="NULL"))
 
   def test_eager_templates_compile_once(self): self.assertIs(compiled_chain(3)[1], compiled_chain(3)[1])
+
+  def test_eager_templates_are_exportable(self):
+    template = compiled_chain(3)[1]
+    for u in template.toposort(enter_calls=True):
+      if isinstance(u.arg, ParamArg): self.assertTrue(u.arg.buffer is None and u.arg.val is None, f"runtime state in {u}")
+    self.assertIs(parse_uir(render_uir(template)), template)
 
   def test_repeated_word_loops(self): # for (i..10) cmdbuf[off[i]] = var
     var, offs = UOp.alloc((1,), dtypes.uint32, device="CPU", name="var"), [4 * i * i for i in range(10)]

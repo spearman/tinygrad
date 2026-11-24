@@ -2,7 +2,7 @@ import unittest
 import functools
 from tinygrad import Tensor, Variable, UOp, function
 from tinygrad.uop.ops import KernelInfo
-from tinygrad.schedule import schedule_cache
+from tinygrad.codegen import schedule_cache
 
 def custom_add_kernel(A:UOp, B:UOp, num:int=0) -> UOp:
   return A[0].set(B[0] + num).sink(arg=KernelInfo(f"custom_add_{num}"))
@@ -77,7 +77,7 @@ class TestScheduleCache(unittest.TestCase):
     x = Tensor([1., 1., 1., 1.]).realize()
     schedule_cache.clear()
     out = f(f(f(x))).realize()
-    self.assertEqual(len(schedule_cache), 2)  # one function body and the outer schedule
+    self.assertEqual(len(schedule_cache), 3)  # one function body, the outer schedule, and the final LINEAR
     self.assertEqual(out.tolist(), [29., 29., 29., 29.])
 
   def test_simple_precompile(self):

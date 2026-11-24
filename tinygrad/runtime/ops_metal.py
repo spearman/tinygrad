@@ -2,7 +2,8 @@ from __future__ import annotations
 import subprocess, pathlib, struct, ctypes, tempfile, functools, platform, weakref, threading, array, sys
 from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple
 import tinygrad.runtime.support.objc as objc
-from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, Compiler, CompileError, MMIOInterface
+from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface
+from tinygrad.renderer import Compiler, CompileError, TinyELF
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.cstyle import MetalRenderer
 from tinygrad.runtime.autogen import metal
@@ -87,7 +88,7 @@ MSGSEND, SELNAME = [metal.dll.bind(ctypes.c_void_p)(f) for f in (metal.dll.objc_
 
 # the slot of a handle of the device
 def mtl_handle(d, name:str) -> UOp:
-  return UOp.alloc((len(HANDLES),), dtypes.uint64, 0, device=to_tuple(d)[0], name="handles")[(i:=HANDLES.index(name)):i+1]
+  return UOp.extern((len(HANDLES),), dtypes.uint64, to_tuple(d)[0], "handles")[(i:=HANDLES.index(name)):i+1]
 
 @uopfunc
 def mtl_send(obj:UOp, sel:UOp, a:UOp, b:UOp, c:UOp, out:UOp|None=None) -> UOp: # objc_msgSend by the selector's name, the result to out
@@ -132,12 +133,12 @@ class MetalQueue(HWQueue):
     self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[UOp](), list[tuple[int, int]](), list[UOp](), 0
 
   def exec(self, call:UOp, prg:UOp):
-    args, obj = get_call_kernel_args(call, prg, self.devs), prg.to_elf()
+    args, obj = get_call_kernel_args(call, prg, self.devs), TinyELF.from_program(prg)
     self.rows += (rows:=layout_args(args, off:=round_up(self.nbytes, 256)))
     self.nbytes = max([o + w.dtype.itemsize for o, w in rows], default=off + 8)
 
     # symbolic sizes, set on the command at run time
-    dims = (*prg.arg.global_size, *prg.arg.local_size)
+    dims = sum(prg.arg.launch_dims(call), ())
     if any(isinstance(d, UOp) for d in dims):
       self.sizes.append((len(self.cmds), at:=round_up(self.nbytes, 8)))
       self.rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at)
@@ -196,7 +197,8 @@ def poll_event(p:UOp, t:UOp) -> UOp|None:
 Compiled.pm_lower += PatternMatcher([(UPat(Ops.PARAM, name="p").f(Ops.AFTER, allow_any_len=True, name="t").index(UPat.const(0)).load(), poll_event)])
 
 class MetalDevice(Compiled):
-  has_copy_queue = False
+  renderers = [MetalRenderer]
+  opened:weakref.WeakSet[MetalDevice] = weakref.WeakSet()
 
   def __init__(self, device:str=""):
     self.sysdevice = metal.MTLCreateSystemDefaultDevice()
@@ -216,8 +218,9 @@ class MetalDevice(Compiled):
 
     # https://developer.apple.com/documentation/metal/mtlgpufamily
     def check_family(f): return next(filter(self.sysdevice.supportsFamily, reversed([v for v, nm in metal.enum_MTLGPUFamily.items() if f in nm])), 0)
-    super().__init__(device, MetalAllocator(self), [MetalRenderer], None,
-                     arch=metal.enum_MTLGPUFamily[check_family("Apple") or check_family("Mac")][12:])
+    super().__init__(device, MetalAllocator(self), None,
+                     arch=metal.enum_MTLGPUFamily[check_family("Apple") or check_family("Mac")][12:], props={"copy": 0})
+    MetalDevice.opened.add(self)
     Compiled.link_bufs |= {to_name(self.device, "handles"): lambda b: self.handles}
     Compiled.pm_link += PatternMatcher([
       (UPat(Ops.BUFFER, name="b").store(UPat(Ops.LINEAR, name="cmds")), lambda b, cmds, d=self: d.new_icb(b.buffer, cmds.src))])
@@ -270,12 +273,15 @@ class MetalDevice(Compiled):
     wait = objc.msg("waitUntilSignaledValue:timeoutMS:", ctypes.c_bool, [ctypes.c_uint64, ctypes.c_uint64])
     if not wait(self.event, value, int(self.wait_timeout_ms)): raise RuntimeError(f"{self.device} signal wait timed out")
 
-  def synchronize(self, timeout:int|None=None):
+  def _read_cb_times(self):
     for slots, start in [(buf.host.view(fmt='Q'), start) for buf, start in self.prof_ents]:
       if slots[start] and not slots[start + 2]: # [command buffer, 0]
         (cb:=metal.MTLCommandBuffer(slots[start])).waitUntilCompleted()
         slots[start], slots[start + 2] = int(cb.GPUStartTime() * 1e9), int(cb.GPUEndTime() * 1e9)
 
+  def synchronize(self, timeout:int|None=None):
+    # the autorelease pool is per thread and shared by every METAL device, popping it frees their command buffers. read them all first
+    for d in MetalDevice.opened: d._read_cb_times()
     super().synchronize(timeout)
     if (pool:=getattr(pools, "pool", None)) is not None: objc.lib.objc_autoreleasePoolPop(pool)
     pools.pool = objc.lib.objc_autoreleasePoolPush()

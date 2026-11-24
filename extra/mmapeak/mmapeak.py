@@ -1,7 +1,7 @@
 import os
 
 # TODO: there is a timing bug without this
-os.environ["AMD_AQL"] = "1"
+os.environ.setdefault("DEV", "AMD:::aql=1")
 
 from tinygrad import Tensor, Device, GlobalCounters, Context, dtypes
 from tinygrad.helpers import getenv, DEV
@@ -37,7 +37,7 @@ def launchBenchmark(instruction, vgprIndices, dense=True, accum=False, **kwargs)
     gidx = UOp.special(NUM_WORKGROUPS, "gidx0")
     FLOPs = FLOPS_PER_MATMUL * NUM_WAVES * NUM_WORKGROUPS * INTERNAL_LOOP * INSTRUCTIONS_PER_LOOP
     sink = UOp.sink(A.base, threads, gidx, arg=KernelInfo(inst.op.name.lower(), estimates=Estimates(ops=FLOPs, mem=0)))
-    return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts]))))
+    return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp.native(x).call() for x in insts]))))
   dummy = Tensor.zeros(1).contiguous().realize()
   out = Tensor.custom_kernel(dummy, fxn=fxn)[0]
   linear = out.schedule_linear()

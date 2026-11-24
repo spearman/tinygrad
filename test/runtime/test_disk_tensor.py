@@ -40,13 +40,11 @@ class TestTorchLoad(TempDirTestCase):
     torch.save({"empty": t.to(torch.bfloat16)[:, 1:1]}, self.tmp("strided_bf16.pt"))
     self.assertEqual(torch_load(self.tmp("strided_bf16.pt"))["empty"].shape, (3, 0))
 
-  # pytorch pkl format
-  def test_load_enet(self): compare_weights_both("https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b0-355c32eb.pth")
-  # pytorch zip format
-  def test_load_enet_alt(self): compare_weights_both("https://download.pytorch.org/models/efficientnet_b0_rwightman-3dd342df.pth")
-  # pytorch zip format
-  @unittest.skip("fetch error")
-  def test_load_convnext(self): compare_weights_both('https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth')
+  @unittest.skipUnless(dtypes.bfloat16 in Device[Device.DEFAULT].renderer.supported_dtypes(), f"no bfloat16 on {Device.DEFAULT}")
+  def test_load_strided_bf16(self):
+    import torch
+    torch.save({"col": torch.arange(1., 13.).reshape(3, 4).to(torch.bfloat16)[:, 1]}, self.tmp("strided_bf16.pt"))
+    self.assertEqual(torch_load(self.tmp("strided_bf16.pt"))["col"].float().tolist(), [2., 6., 10.])
 
   def test_load_llama2bfloat(self): compare_weights_both("https://huggingface.co/qazalin/bf16-lightweight/resolve/main/consolidated.00.pth?download=true")
 
@@ -57,7 +55,7 @@ class TestTorchLoad(TempDirTestCase):
   def test_shared_storage(self):
     import torch
     fn = self.tmp("shared_storage.pth")
-    torch.save({"a": (a := torch.randn(100)), "b": a[5:]}, fn)
+    torch.save({"a": (a := torch.randn(100)), "b": a[5:]}, fn, _use_new_zipfile_serialization=False)
     compare_weights_both(fn)
 
 test_fn = pathlib.Path(__file__).parents[2] / "weights/LLaMA/7B/consolidated.00.pth"
@@ -95,7 +93,7 @@ class TestRawDiskBuffer(unittest.TestCase):
     _test_bitcasted(t, dtypes.float32, 3.1415927)
     _test_bitcasted(t, dtypes.uint32, 0x40490FDB)
     # doesn't suport normal cast
-    with self.assertRaises(NotImplementedError):
+    with self.assertRaisesRegex(RuntimeError, "DISK has no renderers"):
       Tensor.empty((4,), dtype=dtypes.int16, device=f"disk:{tmp}").cast(dtypes.float16).to(None).realize()
 
     # Those two should be moved to test_dtype.py:test_shape_change_bitcast after bitcast works on non-disk
@@ -323,6 +321,11 @@ class TestDiskTensor(TempDirTestCase):
     dt = src.to(f"disk:{self.tmp('dt_simple_setitem')}")
     dt[1] = [3]
     self.assertEqual(dt.tolist(), [[1], [3]])
+
+  def test_simple_setitem_float(self):
+    dt = Tensor.empty(4, device=f"disk:{self.tmp('dt_simple_setitem_float')}")
+    dt[1] = 3.0
+    self.assertEqual(dt.tolist(), [0.0, 3.0, 0.0, 0.0])
 
   def test_strided_setitem(self):
     # test non-contiguous (strided) setitem raises

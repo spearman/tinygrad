@@ -1,13 +1,12 @@
 from typing import TYPE_CHECKING, Callable, Self
 from tinygrad.dtype import ConstType, DType, DTypeLike, Invalid, dtypes, to_dtype
-from tinygrad.helpers import argfix
-from tinygrad.mixin.dtype import DTypeMixin
+from tinygrad.helpers import argfix, canonicalize_device
 from tinygrad.mixin.movement import MovementMixin
 
 if TYPE_CHECKING:
   from tinygrad.uop.ops import sint, UOp
 
-class CreationMixin(DTypeMixin, MovementMixin):
+class CreationMixin(MovementMixin):
   @staticmethod
   def const(b, dtype=None): raise NotImplementedError
 
@@ -33,7 +32,6 @@ class CreationMixin(DTypeMixin, MovementMixin):
     ```
     """
     from tinygrad.uop.ops import UOp
-    from tinygrad.device import canonicalize_device
     dt = to_dtype(dtype) if dtype is not None else dtypes.default_float
     if dt in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {dt}")
     new_shape = argfix(*shape)
@@ -106,9 +104,9 @@ class CreationMixin(DTypeMixin, MovementMixin):
     print(Tensor.full_like(t, 42).numpy())
     ```
     """
-    if isinstance(self.device, tuple):
+    if isinstance(self.device, tuple) and buffer:
       if device is not None: raise RuntimeError("cannot specify `device` on `*_like` of a multi device tensor")
-      return self._multi_like(lambda shape, dev: type(self).full(shape, fill_value, dtype=dtype or self.dtype, device=dev, buffer=buffer))
+      return self._multi_like(lambda shape, dev: type(self).full(shape, fill_value, dtype=dtype or self.dtype, device=dev))
     return type(self).full(self.shape, fill_value, dtype=dtype or self.dtype, device=self.device if device is None else device, buffer=buffer)
 
   @classmethod
